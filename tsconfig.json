@@ -7,6 +7,6 @@
   },
   "files": [
     "typings/tsd.d.ts",
-    "src/MySQL.ts"
+    "src/MSSQL.ts"
   ]
 }
