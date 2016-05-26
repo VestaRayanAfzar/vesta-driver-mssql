@@ -15,10 +15,8 @@ interface ICalculatedQueryOptions {
     condition:string,
 }
 
-export class MySQL extends Database {
-    private pool:IPool;
+export class MSSQL extends Database {
     private sqLconnection:Connection;
-    private request;
     private schemaList:ISchemaList = {};
     private config:IDatabaseConfig;
 

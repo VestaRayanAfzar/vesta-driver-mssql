@@ -1,34 +1,34 @@
 {
-  "name": "vesta-driver-mysql",
-  "version": "0.1.1",
+  "name": "vesta-driver-mssql",
+  "version": "0.0.1",
   "private": true,
-  "description": "Vesta Platform MySQL drievr based on Database Class",
+  "description": "Vesta Platform MSSQL driver based on Database Class",
   "keywords": [
     "NodeJS",
     "TypeScript",
     "Database",
-    "MySQL",
+    "MSSQL",
     "Schema"
   ],
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "tsc -w -p ."
   },
-  "author": "hbtb <bishehsary@gmail.com>",
+  "author": "javadkh2 khalilian.javad@gmail.com>",
   "contributors": [
     {
-      "name": "javadkh2",
-      "email": "khalilian.javad@gmail.com"
+      "name": "hbtb",
+      "email": "bishehsary@gmail.com"
     }
   ],
   "bugs": {
-    "url": "https://github.com/VestaRayanAfzar/vesta-driver-mysql/issues",
+    "url": "https://github.com/VestaRayanAfzar/vesta-driver-mssql/issues",
     "email": "bishehsary@gmail.com"
   },
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/VestaRayanAfzar/vesta-driver-mysql.git"
+    "url": "git+https://github.com/VestaRayanAfzar/vesta-driver-mssql.git"
   },
   "dependencies": {
     "mssql": "^3.3.0",
