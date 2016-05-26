@@ -1,5 +1,4 @@
-import * as mysql from "mysql";
-import {IPool, IConnectionConfig, IConnection} from "mysql";
+import {IPool, Connection, config, Request} from "mssql";
 import {Schema} from "vesta-schema/Schema";
 import {IDatabaseConfig, Database, IQueryOption, ISchemaList} from "vesta-schema/Database";
 import {Err} from "vesta-util/Err";
@@ -16,29 +15,39 @@ interface ICalculatedQueryOptions {
     condition:string,
 }
 
-export class MySQL extends Database  {
+export class MySQL extends Database {
     private pool:IPool;
-    private connection:IConnection;
+    private sqLconnection:Connection;
+    private request;
     private schemaList:ISchemaList = {};
     private config:IDatabaseConfig;
+
+    get connection() {
+        return new Request()
+    }
 
     public connect():Promise<Database> {
         if (this.connection) return Promise.resolve(this);
         return new Promise<Database>((resolve, reject)=> {
-            if (!this.pool) {
-                this.pool = mysql.createPool(<IConnectionConfig>{
-                    host: this.config.host,
-                    port: +this.config.port,
-                    user: this.config.user,
-                    password: this.config.password,
-                    database: this.config.database
-                });
-            }
-            this.pool.getConnection((err, connection)=> {
-                if (err) return reject(new DatabaseError(Err.Code.DBConnection, err.message));
-                this.connection = connection;
-                resolve(this);
+            this.sqLconnection = new Connection(<config>{
+                server: this.config.host,
+                port: +this.config.port,
+                user: this.config.user,
+                password: this.config.password,
+                database: this.config.database,
+                pool: {
+                    min: 5,
+                    max: 100,
+                    idleTimeoutMillis: 1000,
+                }
             });
+            this.sqLconnection.connect((err)=> {
+                if (err) {
+                    return reject(new DatabaseError(Err.Code.DBConnection, err.message));
+                }
+                resolve(this);
+
+            })
         })
     }
 
@@ -51,7 +60,7 @@ export class MySQL extends Database  {
     public init():Promise<boolean> {
         var createSchemaPromise = this.initializeDatabase();
         for (var schema in this.schemaList) {
-            if(this.schemaList.hasOwnProperty(schema)) {
+            if (this.schemaList.hasOwnProperty(schema)) {
                 createSchemaPromise = createSchemaPromise.then(this.createTable(this.schemaList[schema]));
             }
         }
@@ -652,7 +661,7 @@ export class MySQL extends Database  {
                 typeSyntax = `INT(${properties.max ? properties.max.toString(2).length : 20})`;
                 break;
             case FieldType.Object:
-                typeSyntax = `BLOB`;
+                typeSyntax = `BINARY`;
                 break;
             case FieldType.Text:
                 typeSyntax = `TEXT`;
