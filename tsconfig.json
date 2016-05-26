@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "declaration": true,
+    "module": "CommonJS",
+    "target": "es5",
+    "outDir": "package/"
+  },
+  "files": [
+    "typings/tsd.d.ts",
+    "src/MySQL.ts"
+  ]
+}

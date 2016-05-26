@@ -1,0 +1,7 @@
+.idea
+tsd-debug.*
+npm-debug.*
+/node_modules
+/package/*.js
+/package/*.d.ts
+/typings
