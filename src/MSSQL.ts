@@ -73,18 +73,18 @@ export class MSSQL extends Database {
         return createSchemaPromise;
     }
 
-    public findById<T>(model:string, id:number | string, option ?:IQueryOption):Promise <IQueryResult<T>> {
-        var query = new Vql(model)
-            .where(new Condition(Condition.Operator.EqualTo).compare('id', id))
-            .select(...option.fields)
-            .fromOffset(option.offset ? option.offset : (option.page - 1) * option.limit)
-            .limitTo(option.limit)
-            .fetchRecordFor(...option.relations);
-        query.orderBy = option.orderBy;
+    public findById<T>(model:string, id:number | string, option:IQueryOption = {}):Promise <IQueryResult<T>> {
+        var query = new Vql(model);
+        query.where(new Condition(Condition.Operator.EqualTo).compare('id', id));
+        if (option.fields) query.select(...option.fields);
+        if (option.offset || option.page) query.fromOffset(option.offset ? option.offset : (option.page - 1) * option.limit);
+        if (option.relations) query.fetchRecordFor(...option.relations);
+        if (option.limit) query.limitTo(option.limit);
+        query.orderBy = option.orderBy || [];
         return this.findByQuery(query);
     }
 
-    public findByModelValues<T>(model:string, modelValues:T, option ?:IQueryOption):Promise < IQueryResult <T>> {
+    public findByModelValues<T>(model:string, modelValues:T, option:IQueryOption = {}):Promise < IQueryResult <T>> {
         var condition = new Condition(Condition.Operator.And);
         for (var key in modelValues) {
             if (modelValues.hasOwnProperty(key)) {
@@ -93,12 +93,12 @@ export class MSSQL extends Database {
                 condition.append(condition);
             }
         }
-        var query = new Vql(model)
-            .select(...option.fields)
-            .fromOffset(option.offset ? option.offset : (option.page - 1) * option.limit)
-            .fetchRecordFor(...option.relations)
-            .where(condition);
-        query.orderBy = option.orderBy;
+        var query = new Vql(model);
+        if (option.fields) query.select(...option.fields);
+        if (option.offset || option.page) query.fromOffset(option.offset ? option.offset : (option.page - 1) * option.limit);
+        if (option.relations) query.fetchRecordFor(...option.relations);
+        query.where(condition);
+        query.orderBy = option.orderBy || [];
         return this.findByQuery(query);
     }
 
@@ -109,7 +109,7 @@ export class MSSQL extends Database {
             this.connection.query(`SELECT ${params.fields} FROM ${query.model} ${params.condition} ${params.orderBy} ${params.limit}`, (err, list)=> {
                 if (err) {
                     result.error = new Err(Err.Code.DBQuery);
-                    reject(result);
+                    return reject(result);
                 }
                 this.getManyToManyRelation(list, query)
                     .then(list=> {
@@ -146,12 +146,12 @@ export class MSSQL extends Database {
                     }
 
                 }
-                Promise.all(steps)
+                return Promise.all(steps)
                     .then(data=> {
                         this.connection.query(`SELECT * FROM ${model} WHERE id = ${id}`, (err, list)=> {
                             if (err) {
-                                result.error = new Err(Err.Code.DBDelete);
-                                reject(result);
+                                result.error = new Err(Err.Code.DBInsert);
+                                return reject(result);
                             }
                             result.items = list;
                             resolve(result)
@@ -163,7 +163,7 @@ export class MSSQL extends Database {
         });
     }
 
-    public insert<T>(model:string, value:Array<T>):Promise < IUpsertResult <T>> {
+    public insertAll<T>(model:string, value:Array<T>):Promise < IUpsertResult <T>> {
         var result:IUpsertResult<T> = <IUpsertResult<T>>{};
         var fields = this.schemaList[model].getFields();
         var fieldsName = [];
@@ -187,7 +187,7 @@ export class MSSQL extends Database {
             this.connection.query(`INSERT INTO ${model}} (${fieldsName.join(',')}) 
                     VALUES ${insertList.join(',')}`, (err, insertResult)=> {
                 if (err) {
-                    reject(err)
+                    return reject(err)
                 }
                 result.items = insertResult;
                 resolve(result);
@@ -244,8 +244,8 @@ export class MSSQL extends Database {
                 }
                 this.connection.query(`SELECT * FROM ${model} WHERE id = ${value['id']}`, (err, list)=> {
                     if (err) {
-                        result.error = new Err(Err.Code.DBDelete);
-                        reject(result);
+                        result.error = new Err(Err.Code.DBQuery);
+                        return reject(result);
                     }
                     result.items = list;
                     resolve(result)
@@ -267,7 +267,7 @@ export class MSSQL extends Database {
             this.connection.query(`SELECT id FROM ${model} ${sqlCondition ? `WHERE ${sqlCondition}` : ''}`, (err, list)=> {
                 if (err) {
                     result.error = new Err(Err.Code.DBQuery);
-                    reject(result);
+                    return reject(result);
                 }
                 var ids = [];
                 for (var i = list.length; i--;) {
@@ -276,13 +276,13 @@ export class MSSQL extends Database {
                 if (ids.length) {
                     this.connection.query(`UPDATE ${model} SET ${properties.join(',')}  WHERE id IN (${ids.join(',')})}`, (err, updateResult)=> {
                         if (err) {
-                            result.error = new Err(Err.Code.DBDelete);
-                            reject(result);
+                            result.error = new Err(Err.Code.DBUpdate);
+                            return reject(result);
                         }
                         this.connection.query(`SELECT * FROM ${model} WHERE id IN (${ids.join(',')})`, (err, list)=> {
                             if (err) {
-                                result.error = new Err(Err.Code.DBDelete);
-                                reject(result);
+                                result.error = new Err(Err.Code.DBQuery);
+                                return reject(result);
                             }
 
                             result.items = list;
@@ -306,7 +306,7 @@ export class MSSQL extends Database {
             this.connection.query(`DELETE FROM ${model} WHERE id = ${id}}`, (err, deleteResult)=> {
                 if (err) {
                     result.error = new Err(Err.Code.DBDelete);
-                    reject(result);
+                    return reject(result);
                 }
                 for (var field in this.schemaList[model].getFields()) {
                     if (fields.hasOwnProperty(field) && fields[field].properties.type == FieldType.Relation) {
@@ -325,7 +325,7 @@ export class MSSQL extends Database {
             this.connection.query(`SELECT id FROM ${model} ${sqlCondition ? `WHERE ${sqlCondition}` : ''}`, (err, list)=> {
                 if (err) {
                     result.error = new Err(Err.Code.DBQuery);
-                    reject(result);
+                    return reject(result);
                 }
                 var ids = [];
                 for (var i = list.length; i--;) {
@@ -335,7 +335,7 @@ export class MSSQL extends Database {
                     this.connection.query(`DELETE FROM ${model} WHERE id IN ${ids.join(',')}}`, (err, deleteResult)=> {
                         if (err) {
                             result.error = new Err(Err.Code.DBDelete);
-                            reject(result);
+                            return reject(result);
                         }
                         result.items = ids;
                         resolve(result)
@@ -359,9 +359,9 @@ export class MSSQL extends Database {
                     var thisValue:string|number;
                     if (FieldType.Boolean == schemaFields[key].properties.type) {
                         thisValue = value[key] ? 1 : 0
-                    }else if(FieldType.String == schemaFields[key].properties.type || FieldType.Text == schemaFields[key].properties.type ){
+                    } else if (FieldType.String == schemaFields[key].properties.type || FieldType.Text == schemaFields[key].properties.type) {
                         thisValue = value[key].replace ? `N'${value[key].replace('\'', '\'\'')}'` : value[key];
-                    } else  {
+                    } else {
                         thisValue = value[key].replace ? `'${value[key].replace('\'', '\'\'')}'` : value[key];
                     }
                     properties.push({field: key, value: thisValue})
@@ -474,7 +474,7 @@ export class MSSQL extends Database {
                 ON (m.id = r.${rightKey}) 
                 WHERE r.${leftKey} IN (${ids.join(',')})`, (err, relatedList)=> {
                     if (err) {
-                        reject(err);
+                        return reject(err);
                     }
                     var result = {};
                     result[relationName] = relatedList;
@@ -744,19 +744,27 @@ export class MSSQL extends Database {
         var fields = this.schemaList[modelName].getFields();
         if (fields[relation] && fields[relation].properties.type == FieldType.Relation
             && fields[relation].properties.relation.type != Relationship.Type.Many2Many) {
-            if (+value > 0) {
+            var readIdPromise = Promise.reject(new Err(Err.Code.DBUpdate));
+            if (fields[relation].properties.relation.isWeek && typeof value == 'object' && !value['id']) {
+                var relatedObject = new fields[relation].properties.relation.model(value);
+                readIdPromise = relatedObject.insert().then(result=> {
+                    return result.items[0]['id'];
+                })
+            } else if (+value > 0) {
+                var id = +value ? +value : +value['id'];
+                readIdPromise = Promise.resolve(id);
+            }
+            return readIdPromise.then(id=> {
                 return new Promise((resolve, reject)=> {
                     this.connection.query(`UPDATE ${modelName} SET ${relation} = '${value}' WHERE id='${model['id']}' `, (err, updateResult)=> {
                         if (err) {
-                            reject(new Err(Err.Code.DBUpdate));
+                            return reject(new Err(Err.Code.DBUpdate));
                         }
                         result.items = updateResult;
                         resolve(result);
                     })
                 })
-            } else if (fields[relation].properties.relation.isWeek) {
-                return this.insertOne(fields[relation].properties.relation.model.schema.name, value);
-            }
+            })
         }
     }
 
@@ -770,17 +778,20 @@ export class MSSQL extends Database {
         if (fields[relation] && fields[relation].properties.type == FieldType.Relation
             && fields[relation].properties.relation.type == Relationship.Type.Many2Many) {
             if (+value > 0) {
-                relationIds.push(value);
+                relationIds.push(+value);
             } else if (value instanceof Array) {
                 for (var i = value['length']; i--;) {
                     if (+value[i]) {
                         relationIds.push(+value[i])
-                    } else if (typeof value[i] == 'object' && fields[relation].properties.relation.isWeek) {
-                        newRelation.push(value[i])
+                    } else if (typeof value[i] == 'object') {
+                        if (+value[i]['id'])relationIds.push(+value[i]['id']);
+                        else if (fields[relation].properties.relation.isWeek) newRelation.push(value[i])
                     }
                 }
-            } else if (typeof value == 'object' && fields[relation].properties.relation.isWeek) {
-                newRelation.push(value)
+            } else if (typeof value == 'object') {
+                if (+value['id']) {
+                    relationIds.push(+value['id'])
+                } else if (fields[relation].properties.relation.isWeek) newRelation.push(value)
             }
         } else {
             return Promise.reject(new Err(Err.Code.DBInsert));
@@ -788,9 +799,9 @@ export class MSSQL extends Database {
         return new Promise<Array<number>>(
             (resolve, reject)=> {
                 if (!newRelation.length) {
-                    resolve(relationIds);
+                    return resolve(relationIds);
                 }
-                this.insert(relatedModelName, newRelation)
+                this.insertAll(relatedModelName, newRelation)
                     .then(result=> {
                         for (var i = result.items.length; i--;) {
                             relationIds.push(result.items[i].id);
@@ -798,7 +809,7 @@ export class MSSQL extends Database {
                         resolve(relationIds)
                     })
                     .catch(()=> {
-                        reject(new Err(Err.Code.DBInsert));
+                        return reject(new Err(Err.Code.DBInsert));
                     })
             })
             .then(relationIds=> {
@@ -810,7 +821,7 @@ export class MSSQL extends Database {
                     this.connection.query(`INSERT INTO ${modelName}Has${this.pascalCase(relation)} 
                     (${this.camelCase(modelName)},${this.camelCase(relatedModelName)}) VALUES ${insertList.join(',')}`, (err, insertResult)=> {
                         if (err) {
-                            reject(new Err(Err.Code.DBInsert));
+                            return reject(new Err(Err.Code.DBInsert));
                         }
                         result.items = insertResult;
                         resolve(result);
@@ -848,7 +859,7 @@ export class MSSQL extends Database {
         return new Promise((resolve, reject)=> {
             this.connection.query(`UPDATE ${model} SET ${relation} = 0 WHERE ${paredCondition}`, (err, updateResult)=> {
                 if (err) {
-                    reject(new Err(Err.Code.DBUpdate))
+                    return reject(new Err(Err.Code.DBUpdate))
                 } else {
                     result.items = updateResult;
                     resolve(result);
@@ -885,7 +896,7 @@ export class MSSQL extends Database {
             .then(relationCondition=> {
                 var intermediateModel = model + 'Has' + this.pascalCase(relation);
                 return this.deleteAll(intermediateModel, relationCondition)
-            }); 
+            });
 
     }
 
