@@ -239,7 +239,9 @@ export class MSSQL extends Database {
         var analysedValue = this.getAnalysedValue<T>(model, value);
         var properties = [];
         for (var i = analysedValue.properties.length; i--;) {
-            properties.push(`${analysedValue.properties[i].field} = ${analysedValue.properties[i].value}`);
+            if(analysedValue.properties[i].field != 'id') {
+                properties.push(`${analysedValue.properties[i].field} = ${analysedValue.properties[i].value}`);
+            }
         }
         var id = value['id'];
         var steps = [];
@@ -872,6 +874,8 @@ export class MSSQL extends Database {
     }
 
     public escape(value) {
+        if (typeof value == 'number') return value;
+        if (typeof value == 'boolean') return value ? 1 : 0;
         return `'${value.replace('\'','\'\'')}'`;
     }
 
