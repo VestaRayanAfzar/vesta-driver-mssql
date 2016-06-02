@@ -453,7 +453,7 @@ export class MSSQL extends Database {
             var fields = '*';
             if (typeof query.relations[i] != 'string') {
                 for (var j = query.relations[i]['fields'].length; j--;) {
-                    query.relations[i]['fields'][j] = `${query.relations[i]['fields'][j]}`;
+                    query.relations[i]['fields'][j] = `m.${query.relations[i]['fields'][j]}`;
                 }
                 fields = query.relations[i]['fields'].join(',');
             }
