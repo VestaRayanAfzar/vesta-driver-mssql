@@ -21,7 +21,7 @@ export class MSSQL extends Database {
     private schemaList:ISchemaList = {};
     private config:IDatabaseConfig;
     private models:IModelCollection;
-    private primaryKeys:{[name:string]:string};
+    private primaryKeys:{[name:string]:string} = {};
 
     get connection() {
         return new Request(this.SQLConnection);
@@ -125,8 +125,8 @@ export class MSSQL extends Database {
         var result:IQueryResult<T> = <IQueryResult<T>>{};
         params.condition = params.condition ? 'WHERE ' + params.condition : '';
         params.orderBy = params.orderBy ? 'ORDER BY ' + params.orderBy : '';
-        var totalPromise = this.query(`SELECT COUNT(*) as total FROM \`${query.model}\` ${params.join} ${params.condition}`);
-        var itemsPromise = this.query<Array<T>>(`SELECT ${params.fields} FROM \`${query.model}\` ${params.join} ${params.condition} ${params.orderBy} ${params.limit}`);
+        var totalPromise = this.query(`SELECT COUNT(*) as total FROM [${query.model}] ${params.join} ${params.condition}`);
+        var itemsPromise = this.query<Array<T>>(`SELECT ${params.fields} FROM [${query.model}] ${params.join} ${params.condition} ${params.orderBy} ${params.limit}`);
         return Promise.all([totalPromise, itemsPromise])
             .then(data=> {
                 var list = data[1];
