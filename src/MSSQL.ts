@@ -482,7 +482,7 @@ export class MSSQL extends Database {
                     default :
                         type = 'LEFT JOIN';
                 }
-                joins.push(`${type} ${join.vql.model} ON (${query.model}.${join.field} = ${join.vql.model}.${this.pk(join.vql.model)})`);
+                joins.push(`${type} [${join.vql.model}] ON ([${query.model}].${join.field} = [${join.vql.model}].${this.pk(join.vql.model)})`);
                 var joinParam = this.getQueryParams(join.vql);
                 if (joinParam.fields) {
                     fields.push(joinParam.fields);
@@ -504,6 +504,7 @@ export class MSSQL extends Database {
     }
 
     private getCondition(model:string, condition:Condition) {
+        model = condition.model || model;
         var operator = this.getOperatorSymbol(condition.operator);
         if (!condition.isConnector) {
             return `([${model}].${condition.comparison.field} ${operator} ${condition.comparison.isValueOfTypeField ? `[${model}].${condition.comparison.value}` : `${this.escape(condition.comparison.value)}`})`;
@@ -512,7 +513,8 @@ export class MSSQL extends Database {
             for (var i = 0; i < condition.children.length; i++) {
                 childrenCondition.push(this.getCondition(model, condition.children[i]));
             }
-            return childrenCondition.length ? `(${childrenCondition.join(` ${operator} `)})` : '';
+            var childrenConditionStr = childrenCondition.join(` ${operator} `).trim();
+            return childrenConditionStr ? `(${childrenConditionStr})` : '';
         }
     }
 
