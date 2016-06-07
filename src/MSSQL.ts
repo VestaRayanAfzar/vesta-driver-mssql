@@ -66,9 +66,9 @@ export class MSSQL extends Database {
     }
 
     private pk(modelName):string {
-        if(this.primaryKeys[modelName]){
+        if (this.primaryKeys[modelName]) {
             return this.primaryKeys[modelName]
-        }else {
+        } else {
             var fields = this.schemaList[modelName].getFields();
             for (var field in fields) {
                 if (fields.hasOwnProperty(field)) {
@@ -165,7 +165,7 @@ export class MSSQL extends Database {
                     }
 
                 }
-                return Promise.all(steps).then(()=>this.query(`SELECT * FROM [${model}] WHERE {this.pk(model)} = ${id}`));
+                return Promise.all(steps).then(()=>this.query(`SELECT * FROM [${model}] WHERE ${this.pk(model)} = ${id}`));
             })
             .then(list=> {
                 result.items = <Array<T>>list;
@@ -377,7 +377,7 @@ export class MSSQL extends Database {
         for (var key in value) {
             if (value.hasOwnProperty(key) && schemaFieldsName.indexOf(key) >= 0 && value[key] !== undefined) {
                 if (schemaFields[key].properties.type != FieldType.Relation) {
-                    var thisValue:string|number = `N${this.escape(value[key])}`;
+                    var thisValue:string|number = `${this.escape(value[key])}`;
                     if (FieldType.Boolean == schemaFields[key].properties.type) {
                         thisValue = value[key] ? 1 : 0
                     }
@@ -603,13 +603,22 @@ export class MSSQL extends Database {
     }
 
     private parseJson(str) {
-        var search = ['\n', '\b', '\r', '\t', '\v', '\''];
-        var replace = ['\\n', '\\b', '\\r', '\\t', '\\v', "\\'"];
-        for (var i = search.length; i--;) {
-            str = str.replace(search[i], replace[i]);
+        if (typeof str == 'string' && str) {
+            var replace = ['\\n', '\\b', '\\r', '\\t', '\\v', "\\'"];
+            var search = ['\n', '\b', '\r', '\t', '\v', '\''];
+            for (var i = search.length; i--;) {
+                str = str.replace(search[i], replace[i]);
+            }
+            var json;
+            try {
+                json = JSON.parse(str);
+            } catch (e) {
+                json = str;
+            }
+            return json
+        } else {
+            return str;
         }
-        return JSON.parse(str);
-
     }
 
     private createTable(schema:Schema) {
@@ -962,7 +971,7 @@ export class MSSQL extends Database {
     public escape(value) {
         if (typeof value == 'number') return value;
         if (typeof value == 'boolean') return value ? 1 : 0;
-        return `'${value.replace('\'', '\'\'')}'`;
+        return `N'${value.replace('\'', '\'\'')}'`;
     }
 
     private query<T>(query:string):Promise<T> {
