@@ -398,6 +398,7 @@ export class MSSQL extends Database {
         var params:ICalculatedQueryOptions = <ICalculatedQueryOptions>{};
         query.offset = query.offset ? query.offset : (query.page ? query.page - 1 : 0 ) * query.limit;
         params.limit = '';
+        var defaultSort = false;
         if (+query.limit) {
             params.limit = ` OFFSET ${query.offset} ROWS FETCH NEXT ${query.limit} ROWS ONLY `;
         }
@@ -410,6 +411,7 @@ export class MSSQL extends Database {
             params.orderBy = orderArray.join(',');
         } else if (params.limit) {
             params.orderBy = this.pk(query.model);
+            defaultSort = true;
         }
         var fields:Array<string> = [];
         var modelFields = this.schemaList[query.model].getFields();
@@ -491,7 +493,7 @@ export class MSSQL extends Database {
                     params.condition = params.condition ? `(${params.condition} AND ${joinParam.condition})` : joinParam.condition
                 }
                 if (joinParam.orderBy) {
-                    params.orderBy = params.orderBy ? `${params.orderBy},${joinParam.orderBy}` : joinParam.orderBy;
+                    params.orderBy = params.orderBy && !defaultSort ? `${params.orderBy},${joinParam.orderBy}` : joinParam.orderBy;
                 }
                 if (joinParam.join) {
                     joins.push(joinParam.join)
@@ -975,7 +977,7 @@ export class MSSQL extends Database {
         return `N'${value.replace('\'', '\'\'')}'`;
     }
 
-    private query<T>(query:string):Promise<T> {
+    public query<T>(query:string):Promise<T> {
         return new Promise((resolve, reject)=> {
             this.connection.query(query, (err, result)=> {
                 if (err) return reject(err);

@@ -1,6 +1,6 @@
 {
   "name": "vesta-driver-mssql",
-  "version": "0.0.22",
+  "version": "0.0.24",
   "description": "Vesta Platform MSSQL driver based on Database Class",
   "keywords": [
     "NodeJS",
