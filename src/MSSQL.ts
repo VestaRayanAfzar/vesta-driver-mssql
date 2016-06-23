@@ -196,6 +196,11 @@ export class MSSQL extends Database {
 
         }
 
+        if(!insertList.length){
+            result.items = [];
+            return Promise.resolve(result);
+        }
+
         return this.query<Array<T>>(`INSERT INTO ${model}} (${fieldsName.join(',')}) VALUES ${insertList.join(',')}`)
             .then(insertResult=> {
                 result.items = insertResult;
