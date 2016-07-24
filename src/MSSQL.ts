@@ -5,8 +5,10 @@ import {Err} from "vesta-util/Err";
 import {DatabaseError} from "vesta-schema/error/DatabaseError";
 import {IDeleteResult, IUpsertResult, IQueryResult} from "vesta-schema/ICRUDResult";
 import {Condition, Vql} from "vesta-schema/Vql";
-import {FieldType, Relationship, Field, IFieldProperties} from "vesta-schema/Field";
+import {FieldType, Field, IFieldProperties, RelationType} from "vesta-schema/Field";
 import {IModelFields, Model} from "vesta-schema/Model";
+import resolve = Promise.resolve;
+import reject = Promise.reject;
 
 interface ICalculatedQueryOptions {
     limit:string,
@@ -183,7 +185,7 @@ export class MSSQL extends Database {
         var fieldsName = [];
         var insertList = [];
         for (var field in fields) {
-            if (fields.hasOwnProperty(field) && fields[field].properties.type != FieldType.Relation || fields[field].properties.relation.type != Relationship.Type.Many2Many) {
+            if (fields.hasOwnProperty(field) && fields[field].properties.type != FieldType.Relation || fields[field].properties.relation.type != RelationType.Many2Many) {
                 fieldsName.push(field);
             }
         }
@@ -196,7 +198,7 @@ export class MSSQL extends Database {
 
         }
 
-        if(!insertList.length){
+        if (!insertList.length) {
             result.items = [];
             return Promise.resolve(result);
         }
@@ -217,7 +219,7 @@ export class MSSQL extends Database {
         var modelName = model.constructor['schema'].name;
         var fields = this.schemaList[modelName].getFields();
         if (fields[relation] && fields[relation].properties.type == FieldType.Relation) {
-            if (fields[relation].properties.relation.type != Relationship.Type.Many2Many) {
+            if (fields[relation].properties.relation.type != RelationType.Many2Many) {
                 return this.addOneToManyRelation<T,M>(model, relation, value)
             } else {
                 return this.addManyToManyRelation<T,M>(model, relation, value)
@@ -243,7 +245,7 @@ export class MSSQL extends Database {
         }
         var fields = this.schemaList[modelName].getFields();
         if (fields[relation] && fields[relation].properties.type == FieldType.Relation) {
-            if (fields[relation].properties.relation.type != Relationship.Type.Many2Many) {
+            if (fields[relation].properties.relation.type != RelationType.Many2Many) {
                 return this.removeOneToManyRelation(model, relation)
             } else {
                 return this.removeManyToManyRelation(model, relation, safeCondition)
@@ -281,7 +283,7 @@ export class MSSQL extends Database {
         var steps = [];
         for (var relation in analysedValue.relations) {
             if (analysedValue.relations.hasOwnProperty(relation)) {
-                if (this.schemaList[model].getFields()[relation].properties.relation.type != Relationship.Type.Many2Many) {
+                if (this.schemaList[model].getFields()[relation].properties.relation.type != RelationType.Many2Many) {
                     var fk;
                     if (+analysedValue.relations[relation]) {
                         fk = +analysedValue.relations[relation]
@@ -438,7 +440,7 @@ export class MSSQL extends Database {
                 if (modelFields.hasOwnProperty(key)) {
                     if (modelFields[key].properties.type != FieldType.Relation) {
                         fields.push(`[${alias}].${modelFields[key].fieldName}`);
-                    } else if ((!query.relations || query.relations.indexOf(modelFields[key].fieldName) < 0) && modelFields[key].properties.relation.type != Relationship.Type.Many2Many) {
+                    } else if ((!query.relations || query.relations.indexOf(modelFields[key].fieldName) < 0) && modelFields[key].properties.relation.type != RelationType.Many2Many) {
                         fields.push(`[${alias}].${modelFields[key].fieldName}`);
                     }
                 }
@@ -453,14 +455,14 @@ export class MSSQL extends Database {
             }
             var properties = field.properties;
             if (properties.type == FieldType.Relation) {
-                if (properties.relation.type == Relationship.Type.One2Many || properties.relation.type == Relationship.Type.One2One) {
+                if (properties.relation.type == RelationType.One2Many || properties.relation.type == RelationType.One2One) {
                     var modelFiledList = [];
                     var filedNameList = properties.relation.model.schema.getFieldsNames();
                     var relatedModelFields = properties.relation.model.schema.getFields();
                     for (var j = 0; j < filedNameList.length; j++) {
 
                         if (typeof query.relations[i] == 'string' || query.relations[i]['fields'].indexOf(filedNameList[j]) >= 0) {
-                            if (relatedModelFields[filedNameList[j]].properties.type != FieldType.Relation || relatedModelFields[filedNameList[j]].properties.relation.type != Relationship.Type.Many2Many) {
+                            if (relatedModelFields[filedNameList[j]].properties.type != FieldType.Relation || relatedModelFields[filedNameList[j]].properties.relation.type != RelationType.Many2Many) {
                                 modelFiledList.push(`'"${filedNameList[j]}":','"',c.${filedNameList[j]},'"'`)
                             }
                         }
@@ -569,7 +571,7 @@ export class MSSQL extends Database {
             for (var i = query.relations.length; i--;) {
                 var relationName = typeof query.relations[i] == 'string' ? query.relations[i] : query.relations[i]['name'];
                 var relationship = this.schemaList[query.model].getFields()[relationName].properties.relation;
-                if (relationship.type == Relationship.Type.Many2Many) {
+                if (relationship.type == RelationType.Many2Many) {
                     relations.push(runRelatedQuery(i))
                 }
             }
@@ -611,7 +613,7 @@ export class MSSQL extends Database {
                 if (list[i].hasOwnProperty(key) &&
                     fields.hasOwnProperty(key) &&
                     fields[key].properties.type == FieldType.Relation &&
-                    fields[key].properties.relation.type != Relationship.Type.Many2Many) {
+                    fields[key].properties.relation.type != RelationType.Many2Many) {
                     list[i][key] = this.parseJson(list[i][key]);
                 }
             }
@@ -695,7 +697,7 @@ export class MSSQL extends Database {
                     } else {
                         columnDefinition.push(column);
                     }
-                } else if (fields[field].properties.type == FieldType.Relation && fields[field].properties.relation.type == Relationship.Type.Many2Many) {
+                } else if (fields[field].properties.type == FieldType.Relation && fields[field].properties.relation.type == RelationType.Many2Many) {
                     relations.push(this.relationTable(fields[field], table));
                 }
             }
@@ -727,7 +729,7 @@ export class MSSQL extends Database {
 
     private columnDefinition(filed:Field) {
         var properties = filed.properties;
-        if (properties.relation && properties.relation.type == Relationship.Type.Many2Many) {
+        if (properties.relation && properties.relation.type == RelationType.Many2Many) {
             return '';
         }
         var columnSyntax = `${filed.fieldName} ${this.getType(properties)}`;
@@ -774,7 +776,7 @@ export class MSSQL extends Database {
                 typeSyntax = 'BIGINT';
                 break;
             case FieldType.Relation:
-                if (properties.relation.type == Relationship.Type.One2One || properties.relation.type == Relationship.Type.One2Many) {
+                if (properties.relation.type == RelationType.One2One || properties.relation.type == RelationType.One2Many) {
                     typeSyntax = 'BIGINT';
                 }
                 break;
@@ -1001,6 +1003,15 @@ export class MSSQL extends Database {
                 if (err) return reject(err);
                 resolve(<T>result);
             })
+        })
+    }
+
+    public close(destroy:boolean):Promise<boolean> {
+        return new Promise((resolve, reject)=> {
+            this.SQLConnection.close((err)=> {
+                if(err) reject(err);
+                else resolve(true);
+            });
         })
     }
 

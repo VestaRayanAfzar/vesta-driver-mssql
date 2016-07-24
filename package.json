@@ -32,8 +32,8 @@
   },
   "dependencies": {
     "mssql": "^3.3.0",
-    "vesta-schema": "^0.3.1",
-    "vesta-util": "^0.2.6"
+    "vesta-schema": "^0.4.4",
+    "vesta-util": "^0.2.7"
   },
   "devDependencies": {}
 }
