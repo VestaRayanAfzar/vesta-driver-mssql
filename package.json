@@ -1,6 +1,6 @@
 {
   "name": "vesta-driver-mssql",
-  "version": "0.0.1",
+  "version": "0.2.0",
   "private": true,
   "description": "Vesta Platform MSSQL driver based on Database Class",
   "keywords": [
@@ -32,7 +32,7 @@
   },
   "dependencies": {
     "mssql": "^3.3.0",
-    "vesta-schema": "^0.4.4",
+    "vesta-schema": "^0.5.3",
     "vesta-util": "^0.2.7"
   },
   "devDependencies": {}
