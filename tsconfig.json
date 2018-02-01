@@ -2,11 +2,10 @@
   "compilerOptions": {
     "declaration": true,
     "module": "CommonJS",
-    "target": "es5",
+    "target": "es6",
     "outDir": "package/"
   },
   "files": [
-    "typings/tsd.d.ts",
     "src/MSSQL.ts"
   ],
   "exclude": [

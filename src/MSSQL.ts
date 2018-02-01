@@ -1,39 +1,43 @@
-import {Connection, config, Request} from "mssql";
+import { ConnectionPool, config, Request, Transaction as MSSQLTransaction } from "mssql";
 import {
     Condition,
     Database, DatabaseError, Err, IDatabaseConfig, IModelCollection, IQueryOption, IQueryResult,
     ISchemaList, IUpsertResult, Vql, FieldType, RelationType, Model, IDeleteResult, Field, Schema, IModelFields,
-    IFieldProperties
-} from "vesta-lib";
+    IFieldProperties,
+    Transaction
+} from "@vesta/core";
+import { isUndefined } from "util";
 
 interface ICalculatedQueryOptions {
     limit: string,
     orderBy: string,
     fields: string,
+    fieldsList: Array<string>,
     condition: string,
     join: string,
 }
 
-export class MSSQL extends Database {
+export class MSSQL implements Database {
 
-    private SQLConnection: Connection;
+
+    private pool: ConnectionPool;
     private schemaList: ISchemaList = {};
     private config: IDatabaseConfig;
     private models: IModelCollection;
     private primaryKeys: { [name: string]: string } = {};
+    private quote = '<#quote#>';
 
-    get connection() {
-        return new Request(this.SQLConnection);
+    private getConnection(transaction?: MSSQLTransaction) {
+        if (transaction) return new Request(transaction)
+        return new Request(this.pool);
     }
 
-    increase<T>(model: string, id: string | number, field: string, value: number): Promise<IQueryResult<T>> {
-        throw new Error('Method not implemented.');
-    }
+
 
     public connect(): Promise<Database> {
-        if (this.SQLConnection) return Promise.resolve(this);
+        if (this.pool) return Promise.resolve(this);
         return new Promise<Database>((resolve, reject) => {
-            this.SQLConnection = new Connection(<config>{
+            this.pool = new ConnectionPool(<config>{
                 server: this.config.host,
                 port: +this.config.port,
                 user: this.config.user,
@@ -47,7 +51,7 @@ export class MSSQL extends Database {
                     idleTimeoutMillis: 1000,
                 }
             });
-            this.SQLConnection.connect((err) => {
+            this.pool.connect((err) => {
                 if (err) {
                     return reject(new DatabaseError(Err.Code.DBConnection, err.message));
                 }
@@ -58,15 +62,16 @@ export class MSSQL extends Database {
     }
 
     constructor(config: IDatabaseConfig, models: IModelCollection) {
-        super();
         this.schemaList = {};
+        this.models = {};
         for (let model in models) {
             if (models.hasOwnProperty(model)) {
-                this.schemaList[model] = models[model].schema;
-                this.pk(model)
+                this.schemaList[models[model].schema.name] = models[model].schema;
+                this.models[models[model].schema.name] = models[model];
+                this.pk(models[model].schema.name)
             }
         }
-        this.models = models;
+
         this.config = config;
     }
 
@@ -87,28 +92,56 @@ export class MSSQL extends Database {
         return pk;
     }
 
-    public init(): Promise<boolean> {
-        let createSchemaPromise = this.initializeDatabase();
+    public init(): Promise<any> {
+        let createSchemaPromise: Promise<any> = this.initializeDatabase();
         for (let i = 0, schemaNames = Object.keys(this.schemaList), il = schemaNames.length; i < il; i++) {
             createSchemaPromise = createSchemaPromise.then(this.createTable(this.schemaList[schemaNames[i]]));
         }
         return createSchemaPromise;
     }
 
-    public findById<T>(model: string, id: number | string, option: IQueryOption = {}): Promise<IQueryResult<T>> {
+    private getTransaction(): Promise<MSSQLTransaction> {
+        return new Promise<MSSQLTransaction>((resolve, reject) => {
+            resolve(new MSSQLTransaction(this.pool))
+        })
+    }
+
+    private prepareTransaction(transaction?: Transaction): Promise<Transaction> {
+        if (!transaction) transaction = new Transaction();
+        if (transaction.connection) return Promise.resolve(transaction);
+        const sqlTr = new MSSQLTransaction(this.pool)
+        return this.getTransaction().then(connection => {
+            transaction.connection = connection;
+            transaction.commit = () => new Promise((resolve, reject) => connection.commit((err) => {
+                // if (err && err.fatal) {
+                //     this.close(connection).then(() => reject(err)).catch(() => reject(err));
+                // }
+                err ? reject(err) : resolve(true)
+            }));
+            transaction.rollback = () => new Promise((resolve, reject) => connection.rollback(() => {
+                // connection.release();
+                resolve(true)
+            }));
+            return new Promise<Transaction>((resolve, reject) => connection.begin(undefined, (err) => err ? reject(err) : resolve(transaction)))
+        })
+    }
+
+    private findById<T>(model: string, id: number | string, option: IQueryOption = {}, transaction?: Transaction): Promise<IQueryResult<T>> {
         let query = new Vql(model);
         query.where(new Condition(Condition.Operator.EqualTo).compare(this.pk(model), id));
         if (option.fields) query.select(...option.fields);
         if (option.relations) query.fetchRecordFor(...option.relations);
         query.orderBy = option.orderBy || [];
         query.limitTo(1);
-        return this.findByQuery(query);
+        return this.findByQuery(query, transaction);
     }
 
-    public findByModelValues<T>(model: string, modelValues: T, option: IQueryOption = {}): Promise<IQueryResult<T>> {
+    private findByModelValues<T>(model: string, modelValues: T, option: IQueryOption = {}, transaction?: Transaction): Promise<IQueryResult<T>> {
         let condition = new Condition(Condition.Operator.And);
         for (let i = 0, keys = Object.keys(modelValues), il = keys.length; i < il; i++) {
-            condition.append((new Condition(Condition.Operator.EqualTo)).compare(keys[i], modelValues[keys[i]]));
+            if (modelValues[keys[i]] !== undefined) {
+                condition.append((new Condition(Condition.Operator.EqualTo)).compare(keys[i], modelValues[keys[i]]));
+            }
         }
         let query = new Vql(model);
         if (option.fields) query.select(...option.fields);
@@ -117,43 +150,71 @@ export class MSSQL extends Database {
         if (+option.limit) query.limitTo(option.limit);
         query.where(condition);
         query.orderBy = option.orderBy || [];
-        return this.findByQuery(query);
+        return this.findByQuery(query, transaction);
     }
 
-    public findByQuery<T>(query: Vql): Promise<IQueryResult<T>> {
+    private findByQuery<T>(query: Vql, transaction?: Transaction): Promise<IQueryResult<T>> {
         let params: ICalculatedQueryOptions = this.getQueryParams(query);
         let result: IQueryResult<T> = <IQueryResult<T>>{};
         params.condition = params.condition ? 'WHERE ' + params.condition : '';
         params.orderBy = params.orderBy ? 'ORDER BY ' + params.orderBy : '';
-        return this.query<Array<T>>(`SELECT ${params.fields} FROM [${query.model}] ${params.join} ${params.condition} ${params.orderBy} ${params.limit}`)
+        return this.query<Array<T>>(`SELECT ${params.fields} FROM [${query.model}] ${params.join} ${params.condition} ${params.orderBy} ${params.limit}`, null, transaction)
             .then(list => {
                 return Promise.all([
-                    this.getManyToManyRelation(list, query),
-                    this.getLists(list, query)
+                    this.getManyToManyRelation(list, query, transaction),
+                    this.getLists(list, query, transaction)
                 ]).then(() => list)
             })
             .then(list => {
                 result.items = this.normalizeList(this.schemaList[query.model], list);
+                result.total = result.items.length;
                 return result;
             })
             .catch(err => {
                 if (err) {
-                    return Promise.reject(new Err(Err.Code.DBQuery, err && err.message));
+                    return Promise.reject(new DatabaseError(Err.Code.DBQuery, err));
                 }
             })
     }
 
-    public count<T>(model: string, modelValues: T, option?: IQueryOption): Promise<IQueryResult<T>>
-    public count<T>(query: Vql): Promise<IQueryResult<T>>
-    public count<T>(arg1: string | Vql, modelValues?: T, option?: IQueryOption): Promise<IQueryResult<T>> {
-        if ('string' == typeof arg1) {
-            return this.countByModelValues(<string>arg1, modelValues, option);
-        } else {
-            return this.countByQuery(<Vql>arg1);
-        }
+    public count<T>(model: string, modelValues: T, option?: IQueryOption, transaction?: Transaction): Promise<IQueryResult<T>>
+    public count<T>(query: Vql, transaction?: Transaction): Promise<IQueryResult<T>>
+    public count<T>(arg1: string | Vql, modelValues?: T, option?: IQueryOption, transaction?: Transaction): Promise<IQueryResult<T>> {
+        let prepare: Promise<any> = transaction ? this.prepareTransaction(transaction) : Promise.resolve({});
+        return prepare.then(() => {
+            if ('string' == typeof arg1) {
+                return this.countByModelValues<T>(<string>arg1, modelValues, option, transaction);
+            } else {
+                return this.countByQuery<T>(<Vql>arg1, transaction);
+            }
+        });
     }
 
-    private countByModelValues<T>(model: string, modelValues: T, option: IQueryOption = {}): Promise<IQueryResult<T>> {
+    public find<T>(query: Vql, transaction?: Transaction): Promise<IQueryResult<T>>
+    public find<T>(model: string, id: number | string, option?: IQueryOption, transaction?: Transaction): Promise<IQueryResult<T>>
+    public find<T>(model: string, modelValues: T, option?: IQueryOption, transaction?: Transaction): Promise<IQueryResult<T>>
+    public find<T>(arg1: string | Vql, arg2?: number | string | T, arg3?: IQueryOption, transaction?: Transaction): Promise<IQueryResult<T>> {
+        let prepare: Promise<IQueryResult<T> | Transaction> = transaction ? this.prepareTransaction(transaction) : Promise.resolve(<Promise<IQueryResult<T>>>{});
+        return prepare.then(() => {
+            if ('string' == typeof arg1) {
+                if (+arg2) return this.findById<T>(arg1, <number | string>arg2, arg3, transaction);
+                else return this.findByModelValues<T>(arg1, <T>arg2, arg3, transaction);
+            } else {
+                return this.findByQuery<T>(<Vql>arg1, transaction);
+            }
+        })
+    }
+
+
+    public increase<T>(model: string, id: number | string, field: string, value: number, transaction?: Transaction): Promise<IUpsertResult<T>> {
+        let start: Promise<Transaction> = !transaction ? Promise.resolve(null) : this.prepareTransaction(transaction);
+        return start.then(transaction => this.query(`UPDATE \`${model}\` SET \`${field}\` = \`${field}\` + (?) WHERE ${this.pk(model)} = ?`, [value, id], transaction))
+            .then(data => {
+                return <Promise<IUpsertResult<T>>>this.findById<T>(model, id)
+            })
+    }
+
+    private countByModelValues<T>(model: string, modelValues: T, option: IQueryOption = {}, transaction?: Transaction): Promise<IQueryResult<T>> {
         let condition = new Condition(Condition.Operator.And);
         for (let i = 0, keys = Object.keys(modelValues), il = keys.length; i < il; i++) {
             condition.append((new Condition(Condition.Operator.EqualTo)).compare(keys[i], modelValues[keys[i]]));
@@ -165,22 +226,34 @@ export class MSSQL extends Database {
         if (+option.limit) query.limitTo(option.limit);
         query.where(condition);
         query.orderBy = option.orderBy || [];
-        return this.countByQuery(query);
+        return this.countByQuery(query, transaction);
     }
 
-    public countByQuery<T>(query: Vql): Promise<IQueryResult<T>> {
+    private countByQuery<T>(query: Vql, transaction?: Transaction): Promise<IQueryResult<T>> {
         let result: IQueryResult<T> = <IQueryResult<T>>{};
         let params: ICalculatedQueryOptions = this.getQueryParams(query);
         params.condition = params.condition ? 'WHERE ' + params.condition : '';
-        return this.query(`SELECT COUNT(*) as total FROM [${query.model}] ${params.join} ${params.condition}`)
+        return this.query(`SELECT COUNT(*) as total FROM [${query.model}] ${params.join} ${params.condition}`, null, transaction)
             .then(data => {
                 result.total = data[0]['total'];
                 return result;
             })
     }
 
+    public insert<T>(model: string, value: T, transaction?: Transaction): Promise<IUpsertResult<T>>
+    public insert<T>(model: string, values: Array<T>, transaction?: Transaction): Promise<IUpsertResult<T>>
+    public insert<T>(model: string, arg2: Array<T> | T, transaction?: Transaction): Promise<IUpsertResult<T>> {
+        if (arg2 instanceof Array) {
+            return this.insertAll<T>(model, <Array<T>>arg2, transaction)
+        } else {
+            return this.insertOne<T>(model, <T>arg2, transaction)
+        }
+    }
 
-    public insertOne<T>(model: string, value: T): Promise<IUpsertResult<T>> {
+
+    private insertOne<T>(model: string, value: T, transaction?: Transaction): Promise<IUpsertResult<T>> {
+        let localTransaction = !transaction;
+        let prepare: Promise<Transaction> = this.prepareTransaction(transaction).then(tr => transaction = tr);
         let result: IUpsertResult<T> = <IUpsertResult<T>>{};
         let analysedValue = this.getAnalysedValue<T>(model, value);
         let fields = [];
@@ -190,43 +263,43 @@ export class MSSQL extends Database {
             values.push(analysedValue.properties[i].value);
         }
 
-        return this.query(`INSERT INTO [${model}] (${fields.join(',')}) VALUES (${values.join(',')});SELECT SCOPE_IDENTITY() as id;`)
+        return prepare.then(transaction => this.query(`INSERT INTO [${model}] (${fields.join(',')}) VALUES (${values.join(',')});SELECT SCOPE_IDENTITY() as id;`, null, transaction))
             .then(insertResult => {
                 let steps = [];
                 let id = insertResult[0]['id'];
                 for (let key in analysedValue.relations) {
                     if (analysedValue.relations.hasOwnProperty(key)) {
-                        steps.push(this.addRelation(new this.models[model]({id: insertResult['insertId']}), key, analysedValue.relations[key]));
+                        steps.push(this.addRelation(new this.models[model]({ id: insertResult['insertId'] }), key, analysedValue.relations[key], transaction));
                     }
 
                 }
                 for (let key in analysedValue.lists) {
                     if (analysedValue.lists.hasOwnProperty(key)) {
-                        steps.push(this.addList(new this.models[model]({id: insertResult['insertId']}), key, analysedValue.lists[key]));
+                        steps.push(this.addList(new this.models[model]({ id: insertResult['insertId'] }), key, analysedValue.lists[key], transaction));
                     }
                 }
                 id = insertResult['insertId'];
-                return Promise.all(steps).then(() => this.query(`SELECT * FROM [${model}] WHERE ${this.pk(model)} = ${id}`));
+                return Promise.all(steps).then(() => this.query(`SELECT * FROM [${model}] WHERE ${this.pk(model)} = ${id}`, null, transaction));
             })
             .then(list => {
                 result.items = <Array<T>>list;
-                return result;
+                return localTransaction ? transaction.commit().then(() => result) : result
             })
             .catch(err => {
-                result.error = new Err(Err.Code.DBInsert, err && err.message);
-                return Promise.reject(result);
+                let error = new Err(Err.Code.DBInsert, err && err.message);
+                return localTransaction ? transaction.rollback().then(() => Promise.reject(error)) : Promise.reject(error);
             });
     }
 
-    private updateList<T>(model: T, list, value) {
+    private updateList<T>(model: T, list, value, transaction: Transaction) {
         let modelName = model['schema'].name;
         let table = modelName + this.pascalCase(list) + 'List';
-        return this.query(`DELETE FROM ${table} WHERE fk = ${model[this.pk(modelName)]}`).then(() => {
-            return this.addList(model, list, value)
+        return this.query(`DELETE FROM ${table} WHERE fk = ${model[this.pk(modelName)]}`, null, transaction).then(() => {
+            return this.addList(model, list, value, transaction)
         })
     }
 
-    private addList<T>(model: T, list: string, value: Array<any>): Promise<any> {
+    private addList<T>(model: T, list: string, value: Array<any>, transaction: Transaction): Promise<any> {
         let modelName = model['schema'].name;
         if (!value || !value.length) {
             return Promise.resolve([]);
@@ -238,27 +311,40 @@ export class MSSQL extends Database {
             return result
         }, '');
         let table = modelName + this.pascalCase(list) + 'List';
-        return this.query(`INSERT INTO ${table} ([fk],[value]) VALUES ${values}`)
+        return this.query(`INSERT INTO ${table} ([fk],[value]) VALUES ${values}`, null, transaction)
 
     }
 
-    public insertAll<T>(model: string, value: Array<T>): Promise<IUpsertResult<T>> {
+    private insertAll<T>(model: string, value: Array<T>, transaction?: Transaction): Promise<IUpsertResult<T>> {
         let result: IUpsertResult<T> = <IUpsertResult<T>>{};
         let fields = this.schemaList[model].getFields();
         let fieldsName = [];
         let insertList = [];
+        let pk = this.pk(model);
         for (let field in fields) {
-            if (fields.hasOwnProperty(field) && fields[field].properties.type != FieldType.Relation || fields[field].properties.relation.type != RelationType.Many2Many) {
-                fieldsName.push(field);
+            if (fields.hasOwnProperty(field) && fields[field].properties.type != FieldType.Relation || fields[field].properties.relation.type == RelationType.One2Many || fields[field].properties.relation.type == RelationType.One2One) {
+                // escape primary key with empty value
+                if (field != pk || value[0][pk]) {
+                    fieldsName.push(field);
+                }
             }
         }
         for (let i = value.length; i--;) {
             let insertPart = [];
             for (let j = 0, jl = fieldsName.length; j < jl; j++) {
-                insertPart.push(value[i].hasOwnProperty(fieldsName[j]) ? this.escape(value[i][fieldsName[j]]) : '\'\'');
+                if (fields[fieldsName[j]].properties.type == FieldType.Object) {
+                    insertPart.push(value[i].hasOwnProperty(fieldsName[j]) ? this.escape(JSON.stringify(value[i][fieldsName[j]])) : '\'\'');
+                }
+                else {
+                    let itemValue = value[i][fieldsName[j]];
+                    let isNum = false;
+                    if ([FieldType.Number, FieldType.Integer, FieldType.Timestamp, FieldType.Relation, FieldType.Enum].indexOf(fields[fieldsName[j]].properties.type) >= 0) {
+                        isNum = true;
+                    }
+                    insertPart.push(value[i].hasOwnProperty(fieldsName[j]) ? this.escape(itemValue) : (isNum ? 0 : '\'\''));
+                }
             }
-            insertList.push(`(${insertPart.join(',')})`)
-
+            insertList.push(`(${insertPart.join(',')})`);
         }
 
         if (!insertList.length) {
@@ -266,37 +352,37 @@ export class MSSQL extends Database {
             return Promise.resolve(result);
         }
 
-        return this.query<Array<T>>(`INSERT INTO ${model} (${fieldsName.join(',')}) VALUES ${insertList.join(',')}`)
+        let prepare: Promise<Transaction> = transaction ? this.prepareTransaction(transaction).then(tr => transaction = tr) : Promise.resolve(null);
+        return prepare.then(transaction => this.query<Array<T>>(`INSERT INTO ${model} (${fieldsName.join(',')}) VALUES ${insertList.join(',')}`, null, transaction))
             .then(insertResult => {
                 result.items = insertResult;
                 return result;
             })
             .catch(err => {
-                result.error = new Err(Err.Code.DBInsert, err && err.message);
-                return Promise.reject(result)
+                let error = new Err(Err.Code.DBInsert, err && err.message);
+                return Promise.reject(error)
             });
 
     }
 
-    private addRelation<T, M>(model: T, relation: string, value: number
-        | Array<number>
-        | M
-        | Array<M>): Promise<IUpsertResult<M>> {
+    private addRelation<T, M>(model: T, relation: string, value: number | Array<number> | M | Array<M>, transaction?: Transaction): Promise<IUpsertResult<M>> {
         let modelName = model.constructor['schema'].name;
         let fields = this.schemaList[modelName].getFields();
-        if (fields[relation] && fields[relation].properties.type == FieldType.Relation && value) {
-            if (fields[relation].properties.relation.type != RelationType.Many2Many) {
-                return this.addOneToManyRelation<T, M>(model, relation, value)
-            } else {
-                return this.addManyToManyRelation<T, M>(model, relation, value)
+        if (fields[relation] && fields[relation].properties.type == FieldType.Relation && (value || +value === 0)) {
+            switch (fields[relation].properties.relation.type) {
+                case RelationType.One2Many:
+                case RelationType.One2One:
+                    return this.addOneToManyRelation(model, relation, value, transaction);
+                case RelationType.Many2Many:
+                    return this.addManyToManyRelation(model, relation, value, transaction);
+                default:
+                    return Promise.resolve(<IUpsertResult<M>>{ items: [] });
             }
         }
         return Promise.reject(new Err(Err.Code.DBInsert, 'error in adding relation'));
     }
 
-    private removeRelation<T>(model: T, relation: string, condition?: Condition
-        | number
-        | Array<number>): Promise<any> {
+    private removeRelation<T>(model: T, relation: string, condition?: Condition | number | Array<number>, transaction?: Transaction): Promise<any> {
         let modelName = model.constructor['schema'].name;
         let relatedModelName = this.schemaList[modelName].getFields()[relation].properties.relation.model.schema.name;
         let safeCondition: Condition;
@@ -313,16 +399,20 @@ export class MSSQL extends Database {
         }
         let fields = this.schemaList[modelName].getFields();
         if (fields[relation] && fields[relation].properties.type == FieldType.Relation) {
-            if (fields[relation].properties.relation.type != RelationType.Many2Many) {
-                return this.removeOneToManyRelation(model, relation)
-            } else {
-                return this.removeManyToManyRelation(model, relation, safeCondition)
+            switch (fields[relation].properties.relation.type) {
+                case RelationType.One2Many:
+                case RelationType.One2One:
+                    return this.removeOneToManyRelation(model, relation, transaction);
+                case RelationType.Many2Many:
+                    return this.removeManyToManyRelation(model, relation, safeCondition, transaction);
+                default:
+                    return Promise.resolve({});
             }
         }
         return Promise.reject(new Err(Err.Code.DBDelete, 'error in removing relation'));
     }
 
-    private updateRelations(model: Model, relation, relatedValues) {
+    private updateRelations(model: Model, relation, relatedValues, transaction?: Transaction) {
         let modelName = model.constructor['schema'].name;
         let relatedModelName = this.schemaList[modelName].getFields()[relation].properties.relation.model.schema.name;
         let ids = [0];
@@ -334,13 +424,25 @@ export class MSSQL extends Database {
             }
         }
         return this.query(`DELETE FROM ${this.pascalCase(modelName)}Has${this.pascalCase(relation)} 
-                    WHERE ${this.camelCase(modelName)} = ${model[this.pk(modelName)]}`)
+                    WHERE ${this.camelCase(modelName)} = ${model[this.pk(modelName)]}`, null, transaction)
             .then(() => {
-                return this.addRelation(model, relation, ids)
+                return this.addRelation(model, relation, ids, transaction)
             })
     }
 
-    public updateOne<T>(model: string, value: T): Promise<IUpsertResult<T>> {
+    public update<T>(model: string, value: T, transaction?: Transaction): Promise<IUpsertResult<T>>
+    public update<T>(model: string, newValues: T, condition: Condition, transaction?: Transaction): Promise<IUpsertResult<T>>
+    public update<T>(model: string, value: T, arg3?: Condition | Transaction, arg4?: Transaction): Promise<IUpsertResult<T>> {
+        if (arg3 instanceof Condition) {
+            return this.updateAll(model, value, <Condition>arg3, <Transaction>arg4)
+        } else {
+            return this.updateOne(model, value, <Transaction>arg3)
+        }
+    }
+
+    private updateOne<T>(model: string, value: T, transaction?: Transaction): Promise<IUpsertResult<T>> {
+        let localTransaction = !transaction;
+        let prepare: Promise<Transaction> = this.prepareTransaction(transaction).then(tr => transaction = tr);
         let result: IUpsertResult<T> = <IUpsertResult<T>>{};
         let analysedValue = this.getAnalysedValue<T>(model, value);
         let properties = [];
@@ -353,41 +455,52 @@ export class MSSQL extends Database {
         let steps = [];
         let relationsNames = Object.keys(analysedValue.relations);
         let modelFields = this.schemaList[model].getFields();
-        for (let i = relationsNames.length; i--;) {
-            let relation = relationsNames[i];
-            let relationValue = analysedValue.relations[relation];
-            // todo check if it is required
-            if (!relationValue) continue;
-            if (modelFields[relation].properties.relation.type == RelationType.Many2Many) {
-                steps.push(this.updateRelations(new this.models[model](value), relation, relationValue));
-            } else {
-                let fk = +relationValue;
-                if (!fk && 'object' == typeof relationValue) {
-                    let relatedModelName = modelFields[relation].properties.relation.model.schema.name;
-                    fk = +relationValue[this.pk(relatedModelName)];
-                }
-                if (fk) {
-                    properties.push(`\`${relation}\` = ${fk}`);
-                }
-            }
-        }
-        for (let key in analysedValue.lists) {
-            if (analysedValue.lists.hasOwnProperty(key)) {
-                steps.push(this.updateList(new this.models[model]({id: id}), key, analysedValue.lists[key]));
-            }
-        }
 
-        return Promise.all(steps)
-            .then(() => this.query<Array<T>>(`UPDATE [${model}] SET ${properties.join(',')} WHERE ${this.pk(model)} = ${id}`))
-            .then(() => this.findById(model, id))
+        return prepare.then(transaction => {
+            for (let i = relationsNames.length; i--;) {
+                let relation = relationsNames[i];
+                let relationValue = analysedValue.relations[relation];
+                // todo check if it is required
+                if (!relationValue && (relationValue !== 0)) continue;
+                switch (modelFields[relation].properties.relation.type) {
+                    case RelationType.One2Many:
+                    case RelationType.One2One:
+                        let fk = +relationValue;
+                        if (!fk && 'object' == typeof relationValue) {
+                            let relatedModelName = modelFields[relation].properties.relation.model.schema.name;
+                            fk = +relationValue[this.pk(relatedModelName)];
+                        }
+                        if (fk || fk === 0) {
+                            properties.push(`[${relation}] = ${fk}`);
+                        }
+                        break;
+                    case RelationType.Many2Many:
+                        if (!relationValue) continue;
+                        steps.push(this.updateRelations(new this.models[model](value), relation, relationValue, transaction));
+                        break;
+                }
+            }
+            for (let key in analysedValue.lists) {
+                if (analysedValue.lists.hasOwnProperty(key)) {
+                    steps.push(this.updateList(new this.models[model]({ id: id }), key, analysedValue.lists[key], transaction));
+                }
+            }
+            return Promise.all<any>(steps).then(() => transaction)
+        })
+
+            .then((transaction) => properties.length ? this.query<Array<T>>(`UPDATE [${model}] SET ${properties.join(',')} WHERE ${this.pk(model)} = ${id}`, null, transaction) : [])
+            .then(() => localTransaction ? transaction.commit() : true)
+            .then(() => (<Promise<IUpsertResult<T>>>this.findById<T>(model, id)))
             .catch(err => {
-                result.error = new Err(Err.Code.DBQuery, err && err.message);
-                return Promise.reject(result);
+                let error = new Err(Err.Code.DBQuery, err && err.message);
+                return localTransaction ? transaction.rollback().then(() => Promise.reject(error)) : Promise.reject(error)
             });
 
     }
 
-    public updateAll<T>(model: string, newValues: T, condition: Condition): Promise<IUpsertResult<T>> {
+    private updateAll<T>(model: string, newValues: T, condition: Condition, transaction?: Transaction): Promise<IUpsertResult<T>> {
+        let localTransaction = !transaction;
+        let prepare: Promise<Transaction> = this.prepareTransaction(transaction).then(tr => transaction = tr);
         let sqlCondition = this.getCondition(model, condition);
         let result: IUpsertResult<T> = <IUpsertResult<T>>{};
         let properties = [];
@@ -396,69 +509,91 @@ export class MSSQL extends Database {
                 properties.push(`[${model}].${key} = '${newValues[key]}'`)
             }
         }
-        return this.query<Array<T>>(`SELECT ${this.pk(model)} FROM [${model}] ${sqlCondition ? `WHERE ${sqlCondition}` : ''}`)
+        return prepare.then(transaction => this.query<Array<T>>(`SELECT ${this.pk(model)} FROM [${model}] ${sqlCondition ? `WHERE ${sqlCondition}` : ''}`, null, transaction))
             .then(list => {
                 let ids = [];
                 for (let i = list.length; i--;) {
                     ids.push(list[i][this.pk(model)]);
                 }
                 if (!ids.length) return [];
-                return this.query<any>(`UPDATE [${model}] SET ${properties.join(',')}  WHERE ${this.pk(model)} IN (${ids.join(',')})}`)
+                return this.query<any>(`UPDATE [${model}] SET ${properties.join(',')}  WHERE ${this.pk(model)} IN (${ids.join(',')})}`, null, transaction)
                     .then(updateResult => {
-                        return this.query<Array<T>>(`SELECT * FROM [${model}] WHERE ${this.pk(model)} IN (${ids.join(',')})`)
+                        return this.query<Array<T>>(`SELECT * FROM [${model}] WHERE ${this.pk(model)} IN (${ids.join(',')})`, null, transaction)
                     })
             })
             .then(list => {
                 result.items = list;
-                return result
+                return localTransaction ? transaction.commit().then(() => result) : result;
             })
             .catch(err => {
-                result.error = new Err(Err.Code.DBUpdate, err && err.message);
-                return Promise.reject(result);
+                let error = new Err(Err.Code.DBUpdate, err && err.message);
+                return localTransaction ? transaction.rollback().then(() => Promise.reject(error)) : Promise.reject(error);
             });
     }
 
-    public deleteOne(model: string, id: number | string): Promise<IDeleteResult> {
+    public remove(model: string, id: number | string, transaction?: Transaction): Promise<IDeleteResult>
+    public remove(model: string, condition: Condition, transaction?: Transaction): Promise<IDeleteResult>
+    public remove(model: string, arg2: Condition | number | string, transaction?: Transaction): Promise<IDeleteResult> {
+        if ('string' == typeof arg2 || 'number' == typeof arg2) {
+            return this.deleteOne(model, <number | string>arg2, transaction);
+        } else if (arg2 instanceof Condition) {
+            return this.deleteAll(model, arg2, transaction);
+        } else {
+            return Promise.reject<IDeleteResult>({
+                error: new Err(Err.Code.WrongInput, 'invalid delete request'),
+                items: null
+            });
+        }
+    }
+
+    private deleteOne(model: string, id: number | string, transaction?: Transaction): Promise<IDeleteResult> {
+        let localTransaction = !transaction;
+        let prepare: Promise<Transaction> = this.prepareTransaction(transaction).then(tr => transaction = tr);
         let result: IDeleteResult = <IDeleteResult>{};
         let fields = this.schemaList[model].getFields();
-        return this.query(`DELETE FROM [${model}] WHERE ${this.pk(model)} = ${id}`)
+        return prepare.then(transaction => this.query(`DELETE FROM [${model}] WHERE ${this.pk(model)} = ${id}`, null, transaction))
             .then(deleteResult => {
+                let instance = new this.models[model]();
+                instance[this.pk(model)] = id;
+                let steps = [];
                 for (let field in this.schemaList[model].getFields()) {
                     if (fields.hasOwnProperty(field) && fields[field].properties.type == FieldType.Relation) {
-                        this.removeRelation(model, field, 0)
+                        steps.push(this.removeRelation(instance, field, 0, transaction));
                     }
                 }
                 result.items = [id];
-                return result;
+                return Promise.all(steps).then(() => result);
             })
+            .then(result => localTransaction ? transaction.commit().then(() => result) : result)
             .catch(err => {
-                result.error = new Err(Err.Code.DBDelete, err && err.message);
-                return Promise.reject(result);
+                let error = new Err(Err.Code.DBDelete, err && err.message);
+                return localTransaction ? transaction.rollback().then(() => Promise.reject(error)) : Promise.reject(error)
             })
     }
 
-    public deleteAll<T>(model: string, condition: Condition): Promise<IDeleteResult> {
+    private deleteAll<T>(model: string, condition: Condition, transaction?: Transaction): Promise<IDeleteResult> {
+        let localTransaction = !transaction;
+        let prepare: Promise<Transaction> = this.prepareTransaction(transaction).then(tr => transaction = tr);
+
         let sqlCondition = this.getCondition(model, condition);
         let result: IDeleteResult = <IDeleteResult>{};
-        return this.query<Array<T>>(`SELECT ${this.pk(model)} FROM [${model}] ${sqlCondition ? `WHERE ${sqlCondition}` : ''}`)
+        return prepare.then(transaction => this.query<Array<T>>(`SELECT ${this.pk(model)} FROM [${model}] ${sqlCondition ? `WHERE ${sqlCondition}` : ''}`, null, transaction))
             .then(list => {
                 let ids = [];
                 for (let i = list.length; i--;) {
                     ids.push(list[i][this.pk(model)]);
                 }
                 if (!ids.length) return [];
-                return this.query(`DELETE FROM [${model}] WHERE ${this.pk(model)} IN (${ids.join(',')})`)
-                    .then(deleteResult => {
-                        return ids;
-                    })
+                return this.query(`DELETE FROM [${model}] WHERE ${this.pk(model)} IN (${ids.join(',')})`, null, transaction)
+                    .then(deleteResult => ids)
             })
             .then(ids => {
                 result.items = ids;
-                return result;
+                return localTransaction ? transaction.commit().then(() => result) : result;
             })
             .catch(err => {
-                result.error = new Err(Err.Code.DBDelete, err && err.message);
-                return Promise.reject(result);
+                let error = new Err(Err.Code.DBDelete, err && err.message);
+                return localTransaction ? transaction.rollback().then(() => Promise.reject(error)) : Promise.reject(error);
             })
     }
 
@@ -472,12 +607,12 @@ export class MSSQL extends Database {
         for (let key in value) {
             if (value.hasOwnProperty(key) && schemaFieldsName.indexOf(key) >= 0 && value[key] !== undefined) {
                 if (schemaFields[key].properties.type == FieldType.Relation) {
-                    relations[key.toString()] = value[key]
+                    relations[<string>key] = value[<string>key]
                 } else if (schemaFields[key].properties.type == FieldType.List) {
-                    lists[key.toString()] = value[key]
+                    lists[<string>key] = value[<string>key]
                 } else {
-                    let thisValue: string | number = `${this.escape(value[key])}`;
-                    properties.push({field: key, value: thisValue})
+                    let thisValue: any = schemaFields[key].properties.type == FieldType.Object ? JSON.stringify(value[key]) : value[key];
+                    properties.push({ field: key, value: thisValue })
                 }
             }
         }
@@ -490,7 +625,7 @@ export class MSSQL extends Database {
 
     private getQueryParams(query: Vql, alias: string = query.model): ICalculatedQueryOptions {
         let params: ICalculatedQueryOptions = <ICalculatedQueryOptions>{};
-        query.offset = query.offset ? query.offset : (query.page ? query.page - 1 : 0 ) * query.limit;
+        query.offset = query.offset ? query.offset : (query.page ? query.page - 1 : 0) * query.limit;
         params.limit = '';
         let defaultSort = false;
         if (+query.limit) {
@@ -500,7 +635,9 @@ export class MSSQL extends Database {
         if (query.orderBy.length) {
             let orderArray = [];
             for (let i = 0; i < query.orderBy.length; i++) {
-                orderArray.push(`[${alias}].${query.orderBy[i].field} ${query.orderBy[i].ascending ? 'ASC' : 'DESC'}`);
+                if (this.models[query.model].schema.getField(query.orderBy[i].field)) {
+                    orderArray.push(`[${alias}].${query.orderBy[i].field} ${query.orderBy[i].ascending ? 'ASC' : 'DESC'}`);
+                }
             }
             params.orderBy = orderArray.join(',');
         } else if (params.limit) {
@@ -511,8 +648,13 @@ export class MSSQL extends Database {
         let modelFields = this.schemaList[query.model].getFields();
         if (query.fields && query.fields.length) {
             for (let i = 0; i < query.fields.length; i++) {
-                if (modelFields[query.fields[i].toString()] && modelFields[query.fields[i].toString()].properties.type == FieldType.List) continue;
-                fields.push(`[${alias}].${query.fields[i]}`)
+                if (query.fields[i] instanceof Vql) {
+                    fields.push(this.getSubQuery(<Vql>query.fields[i]));
+                }
+                else if (modelFields[<string>query.fields[i]]) {
+                    if (modelFields[<string>query.fields[i]].properties.type == FieldType.List) continue;
+                    fields.push(`[${alias}].${query.fields[i]}`)
+                }
             }
         } else {
             for (let key in modelFields) {
@@ -520,7 +662,9 @@ export class MSSQL extends Database {
                     if (modelFields[key].properties.type == FieldType.List) continue;
                     if (modelFields[key].properties.type != FieldType.Relation) {
                         fields.push(`[${alias}].${modelFields[key].fieldName}`);
-                    } else if ((!query.relations || query.relations.indexOf(modelFields[key].fieldName) < 0) && modelFields[key].properties.relation.type != RelationType.Many2Many) {
+                    }
+                    else if ((!query.relations || query.relations.indexOf(modelFields[key].fieldName) < 0)
+                        && (modelFields[key].properties.relation.type == RelationType.One2Many || modelFields[key].properties.relation.type == RelationType.One2One)) {
                         fields.push(`[${alias}].${modelFields[key].fieldName}`);
                     }
                 }
@@ -542,8 +686,9 @@ export class MSSQL extends Database {
                     for (let j = 0; j < filedNameList.length; j++) {
 
                         if (typeof query.relations[i] == 'string' || query.relations[i]['fields'].indexOf(filedNameList[j]) >= 0) {
-                            if (relatedModelFields[filedNameList[j]].properties.type != FieldType.Relation || relatedModelFields[filedNameList[j]].properties.relation.type != RelationType.Many2Many) {
-                                modelFiledList.push(`'"${filedNameList[j]}":','"',c.${filedNameList[j]},'"'`)
+                            if (relatedModelFields[filedNameList[j]].properties.type != FieldType.List && (relatedModelFields[filedNameList[j]].properties.type != FieldType.Relation ||
+                                (relatedModelFields[filedNameList[j]].properties.relation.type == RelationType.One2One || relatedModelFields[filedNameList[j]].properties.relation.type == RelationType.One2Many))) {
+                                modelFiledList.push(`'${this.quote}${filedNameList[j]}${this.quote}:','${this.quote}',c.${filedNameList[j]},'${this.quote}'`)
                             }
                         }
                     }
@@ -554,7 +699,7 @@ export class MSSQL extends Database {
         }
         params.condition = '';
         if (query.condition) {
-            params.condition = this.getCondition(alias, query.condition);
+            params.condition = this.getCondition(query.model, query.condition, alias);
             params.condition = params.condition ? params.condition : '';
         }
         params.join = '';
@@ -564,48 +709,69 @@ export class MSSQL extends Database {
                 let join = query.joins[i];
                 let type = '';
                 switch (join.type) {
-                    case Vql.Join :
+                    case Vql.Join:
                         type = 'FULL OUTER JOIN';
                         break;
-                    case Vql.LeftJoin :
+                    case Vql.LeftJoin:
                         type = 'LEFT JOIN';
                         break;
-                    case Vql.RightJoin :
+                    case Vql.RightJoin:
                         type = 'RIGHT JOIN';
                         break;
-                    case Vql.InnerJoin :
+                    case Vql.InnerJoin:
                         type = 'INNER JOIN';
                         break;
-                    default :
+                    default:
                         type = 'LEFT JOIN';
                 }
-                let modelsAlias = join.vql.model + Math.floor(Math.random() * 100).toString();
-                joins.push(`${type} [${join.vql.model}] as ${modelsAlias} ON ([${alias}].${join.field} = [${modelsAlias}].${this.pk(join.vql.model)})`);
-                let joinParam = this.getQueryParams(join.vql, modelsAlias);
-                if (joinParam.fields) {
-                    fields.push(joinParam.fields);
-                }
-                if (joinParam.condition) {
-                    params.condition = params.condition ? `(${params.condition} AND ${joinParam.condition})` : joinParam.condition
-                }
-                if (joinParam.orderBy) {
-                    params.orderBy = params.orderBy && !defaultSort ? `${params.orderBy},${joinParam.orderBy}` : joinParam.orderBy;
-                }
-                if (joinParam.join) {
-                    joins.push(joinParam.join)
+                let modelsAlias = join.vql.model + '_' + join.field;// + '__' + Math.floor(Math.random() * 100).toString(); // creating alias need refactoring some part code so i ignored it for this time.
+                if (this.models[alias].schema.getField(join.field) && this.models[join.vql.model]) {
+                    joins.push(`${type} ${join.vql.model} as ${modelsAlias} ON (${alias}.${join.field} = ${modelsAlias}.${this.pk(join.vql.model)})`);
+                    let joinParam = this.getQueryParams(join.vql, modelsAlias);
+                    if (joinParam.fields) {
+                        fields.push(joinParam.fields);
+                    }
+                    if (joinParam.condition) {
+                        params.condition = params.condition ? `(${params.condition} AND ${joinParam.condition})` : joinParam.condition
+                    }
+                    if (joinParam.orderBy) {
+                        params.orderBy = params.orderBy ? `${params.orderBy},${joinParam.orderBy}` : joinParam.orderBy;
+                    }
+                    if (joinParam.join) {
+                        joins.push(joinParam.join)
+                    }
                 }
             }
             params.join = joins.join('\n');
         }
         params.fields = fields.join(',');
+        params.fieldsList = fields;
         return params;
     }
 
-    private getCondition(model: string, condition: Condition) {
+    private getSubQuery<T>(query: Vql) {
+        query.relations = []; //relations not handle in next version;
+        query.joins = [];
+        let params: ICalculatedQueryOptions = this.getQueryParams(query, query.model);
+        params.condition = params.condition ? 'WHERE ' + params.condition : '';
+        params.orderBy = params.orderBy ? 'ORDER BY ' + params.orderBy : '';
+        let modelFiledList = [];
+        for (let i = 0, il = params.fieldsList.length; i < il; i++) {
+            let field = params.fieldsList[i].replace(`\`${query.model}\`.`, '');
+            modelFiledList.push(`'${this.quote}${field}${this.quote}:','${this.quote}',${field},'${this.quote}'`)
+        }
+        let modelAs = query.model[0].toLowerCase() + query.model.substr(1, query.model.length - 1);
+        return `(SELECT CONCAT('{',${modelFiledList.join(',",",')},'}') FROM \`${query.model}\` ${params.condition} ${params.orderBy} limit 1) as \`${modelAs}\``;
+    }
+
+    private getCondition(model: string, condition: Condition, alias: string = model) {
         model = condition.model || model;
         let operator = this.getOperatorSymbol(condition.operator);
         if (!condition.isConnector) {
-            return `([${model}].${condition.comparison.field} ${operator} ${condition.comparison.isValueOfTypeField ? `[${model}].${condition.comparison.value}` : `${this.escape(condition.comparison.value)}`})`;
+            if (!this.models[model].schema.getField(condition.comparison.field)) {
+                return '';
+            }
+            return `([${alias}].${condition.comparison.field} ${operator} ${condition.comparison.isValueOfTypeField ? condition.comparison.value : `${this.escape(isUndefined(condition.comparison.value.id) ? condition.comparison.value : +condition.comparison.value.id)}`})`;
         } else {
             let childrenCondition = [];
             for (let i = 0; i < condition.children.length; i++) {
@@ -617,43 +783,28 @@ export class MSSQL extends Database {
         }
     }
 
-    private getManyToManyRelation(list: Array<any>, query: Vql) {
+    private getManyToManyRelation(list: Array<any>, query: Vql, transaction?: Transaction) {
         let ids = [];
-        let runRelatedQuery = (i) => {
-            let relationName = typeof query.relations[i] == 'string' ? query.relations[i] : query.relations[i]['name'];
-            let relationship = this.schemaList[query.model].getFields()[relationName].properties.relation;
-            let fields = '*';
-            if (typeof query.relations[i] != 'string') {
-                for (let j = query.relations[i]['fields'].length; j--;) {
-                    query.relations[i]['fields'][j] = `m.${query.relations[i]['fields'][j]}`;
-                }
-                fields = query.relations[i]['fields'].join(',');
-            }
-            let leftKey = this.camelCase(query.model);
-            let rightKey = this.camelCase(relationship.model.schema.name);
-            return this.query(`SELECT ${fields},r.${leftKey},r.${rightKey}  FROM [${relationship.model.schema.name}] m 
-                LEFT JOIN [${query.model + 'Has' + this.pascalCase(relationName)}] r 
-                ON (m.${this.pk(relationship.model.schema.name)} = r.${rightKey}) 
-                WHERE r.${leftKey} IN (${ids.join(',')})`)
-                .then(relatedList => {
-                    let result = {};
-                    result[relationName] = relatedList;
-                    return result;
-                })
 
-
-        };
         for (let i = list.length; i--;) {
             ids.push(list[i][this.pk(query.model)]);
         }
         let relations: Array<Promise<any>> = [];
-        let relationship;
         if (ids.length && query.relations && query.relations.length) {
             for (let i = query.relations.length; i--;) {
                 let relationName = typeof query.relations[i] == 'string' ? query.relations[i] : query.relations[i]['name'];
-                relationship = this.schemaList[query.model].getFields()[relationName].properties.relation;
+                let field = this.schemaList[query.model].getFields()[relationName];
+                let relationship = field.properties.relation;
                 if (relationship.type == RelationType.Many2Many) {
-                    relations.push(runRelatedQuery(i))
+                    relations.push(this.runRelatedQuery(query, i, ids, transaction))
+                } else if (relationship.type == RelationType.Reverse) {
+                    let reverseField = this.getReverseRelation(query, field);
+                    if (reverseField.properties.relation.type == RelationType.One2Many || reverseField.properties.relation.type == RelationType.One2One) {
+                        relations.push(this.runReverseQueryOne2Many(query, i, ids, reverseField, transaction));
+                    } else if (reverseField.properties.relation.type == RelationType.Many2Many) {
+                        relations.push(this.runRelatedQueryMany2Many(query, i, ids, reverseField, transaction));
+                    }
+
                 }
             }
         }
@@ -661,10 +812,11 @@ export class MSSQL extends Database {
         return Promise.all(relations)
             .then(data => {
                 let leftKey = this.camelCase(query.model);
-                let rightKey = this.camelCase(relationship.model.schema.name);
                 for (let i = data.length; i--;) {
                     for (let related in data[i]) {
                         if (data[i].hasOwnProperty(related)) {
+                            let relationship = this.schemaList[query.model].getFields()[related].properties.relation;
+                            let rightKey = this.camelCase(relationship.model.schema.name);
                             for (let k = list.length; k--;) {
                                 let id = list[k][this.pk(query.model)];
                                 list[k][related] = [];
@@ -687,10 +839,96 @@ export class MSSQL extends Database {
 
     }
 
-    private getLists(list: Array<any>, query: Vql) {
+    private runRelatedQuery(query: Vql, i: number, ids: Array<number>, transaction?: Transaction) {
+        let relationName = typeof query.relations[i] == 'string' ? query.relations[i] : query.relations[i]['name'];
+        let relationship = this.schemaList[query.model].getFields()[relationName].properties.relation;
+        let fields = '*';
+        if (typeof query.relations[i] != 'string') {
+            for (let j = query.relations[i]['fields'].length; j--;) {
+                query.relations[i]['fields'][j] = `m.${query.relations[i]['fields'][j]}`;
+            }
+            fields = query.relations[i]['fields'].join(',');
+        }
+        let leftKey = this.camelCase(query.model);
+        let rightKey = this.camelCase(relationship.model.schema.name);
+        return this.query(`SELECT ${fields},r.${leftKey},r.${rightKey}  FROM \`${relationship.model.schema.name}\` m 
+                LEFT JOIN \`${query.model + 'Has' + this.pascalCase(relationName)}\` r 
+                ON (m.${this.pk(relationship.model.schema.name)} = r.${rightKey}) 
+                WHERE r.${leftKey} IN (?)`, [ids], transaction)
+            .then(relatedList => {
+                let result = {};
+                result[relationName] = relatedList;
+                return result;
+            })
+
+
+    };
+
+    private runReverseQueryOne2Many(query: Vql, i: number, ids: Array<number>, reverseField: Field, transaction?: Transaction) {
+        let relationName = typeof query.relations[i] == 'string' ? query.relations[i] : query.relations[i]['name'];
+        let relationship = this.schemaList[query.model].getFields()[relationName].properties.relation;
+        let fields = ['*'];
+        if (typeof query.relations[i] != 'string') {
+            fields = query.relations[i]['fields'];
+        }
+        let leftKey = this.camelCase(query.model);
+        let rightKey = this.camelCase(relationship.model.schema.name);
+        fields.push(`${reverseField.fieldName} as ${leftKey}`);
+        fields.push(`${this.pk(relationship.model.schema.name)} as ${rightKey}`);
+        return this.query(`SELECT ${fields.join(',')} FROM ${relationship.model.schema.name} WHERE ${reverseField.fieldName} IN (?)`, [ids], transaction)
+            .then(list => {
+                let data = {};
+                data[relationName] = list;
+                return data;
+            })
+    };
+
+    private runRelatedQueryMany2Many(query: Vql, i: number, ids: Array<number>, reverseField: Field, transaction?: Transaction) {
+        let relationName = typeof query.relations[i] == 'string' ? query.relations[i] : query.relations[i]['name'];
+        let relationship = this.schemaList[query.model].getFields()[relationName].properties.relation;
+        let fields = '*';
+        if (typeof query.relations[i] != 'string') {
+            for (let j = query.relations[i]['fields'].length; j--;) {
+                query.relations[i]['fields'][j] = `m.${query.relations[i]['fields'][j]}`;
+            }
+            fields = query.relations[i]['fields'].join(',');
+        }
+        let leftKey = this.camelCase(query.model);
+        let rightKey = this.camelCase(relationship.model.schema.name);
+        return this.query(`SELECT ${fields},r.${leftKey},r.${rightKey}  FROM \`${relationship.model.schema.name}\` m 
+                LEFT JOIN \`${relationship.model.schema.name + 'Has' + this.pascalCase(reverseField.fieldName)}\` r 
+                ON (m.${this.pk(query.model)} = r.${rightKey}) 
+                WHERE r.${leftKey} IN (?)`, [ids], transaction)
+            .then(relatedList => {
+                let result = {};
+                result[relationName] = relatedList;
+                return result;
+            })
+
+
+    };
+
+
+    private getReverseRelation(query: Vql, field: Field): Field | null {
+        let modelName = query.model;
+        let relatedField = null;
+        let relatedModel = field.properties.relation.model;
+        let fields = relatedModel.schema.getFields();
+        let keys = relatedModel.schema.getFieldsNames();
+        for (let i = 0, il = keys.length; i < il; i++) {
+            let properties = fields[keys[i]].properties;
+            if (properties.type == FieldType.Relation && properties.relation.model.schema.name == modelName) {
+                relatedField = fields[keys[i]];
+                break;
+            }
+        }
+        return relatedField;
+    }
+
+    private getLists(list: Array<any>, query: Vql, transaction?: Transaction) {
         let runListQuery = (listName) => {
             let name = query.model + this.pascalCase(listName) + 'List';
-            return this.query(`SELECT * FROM [${name}] WHERE [fk] IN (${ids.join(',')})`)
+            return this.query(`SELECT * FROM [${name}] WHERE [fk] IN (${ids.join(',')})`, null, transaction)
                 .then(listsData => {
                     return {
                         name: listName,
@@ -740,25 +978,31 @@ export class MSSQL extends Database {
         for (let i = list.length; i--;) {
             for (let key in list[i]) {
                 if (list[i].hasOwnProperty(key) &&
-                    fields.hasOwnProperty(key) &&
-                    fields[key].properties.type == FieldType.Relation &&
-                    fields[key].properties.relation.type != RelationType.Many2Many) {
-                    list[i][key] = this.parseJson(list[i][key]);
+                    fields.hasOwnProperty(key) && (fields[key].properties.type == FieldType.Object || (
+                        fields[key].properties.type == FieldType.Relation &&
+                        (fields[key].properties.relation.type == RelationType.One2Many
+                            || fields[key].properties.relation.type == RelationType.One2One)))) {
+                    list[i][key] = this.parseJson(list[i][key], fields[key].properties.type == FieldType.Object);
+                } else if (list[i].hasOwnProperty(key) && !fields.hasOwnProperty(key)) {
+                    let isObject = list[i][key] && list[i][key].indexOf && list[i][key].indexOf(this.quote) < 0;
+                    list[i][key] = this.parseJson(list[i][key], isObject);
                 }
             }
         }
         return list;
     }
 
-    private parseJson(str) {
+    private parseJson(str, isObject = false) {
         if (typeof str == 'string' && str) {
-            let replace = ['\\n', '\\b', '\\r', '\\t', '\\v', "\\'"];
-            let search = ['\n', '\b', '\r', '\t', '\v', '\''];
-            for (let i = search.length; i--;) {
-                str = str.replace(search[i], replace[i]);
-            }
             let json;
             try {
+                if (!isObject) {
+                    let replace = ['\\n', '”', '\\r', '\\t', '\\v', "’", '"'];
+                    let search = [/\n/ig, /"/ig, /\r/ig, /\t/ig, /\v/ig, /'/ig, new RegExp(this.quote, 'gi')];
+                    for (let i = 0; i < search.length; i++) {
+                        str = str.replace(search[i], replace[i]);
+                    }
+                }
                 json = JSON.parse(str);
             } catch (e) {
                 json = str;
@@ -777,7 +1021,7 @@ export class MSSQL extends Database {
                 .then(() => {
                     return this.query(`CREATE TABLE [${schema.name}] (\n${createDefinition.ownColumn})\n`)
                 });
-        let translateTablePromise = Promise.resolve(true);
+        let translateTablePromise: Promise<any> = Promise.resolve(true);
         if (createDefinition.lingualColumn) {
             translateTablePromise =
                 this.query(`IF OBJECT_ID('${schema.name}_translation', 'U') DROP TABLE ${schema.name}_translation`)
@@ -817,10 +1061,6 @@ export class MSSQL extends Database {
 
     private pascalCase(str) {
         return str[0].toUpperCase() + str.slice(1)
-    }
-
-    private qoute(str) {
-        return `${str}`;
     }
 
     private createDefinition(fields: IModelFields, table: string, checkMultiLingual = true) {
@@ -872,13 +1112,17 @@ export class MSSQL extends Database {
 
     private columnDefinition(filed: Field) {
         let properties = filed.properties;
-        if (properties.type == FieldType.List || (properties.relation && properties.relation.type == RelationType.Many2Many)) {
+        if (properties.type == FieldType.List || (properties.relation && properties.relation.type == RelationType.Many2Many) || (properties.relation && properties.relation.type == RelationType.Reverse)) {
             return '';
         }
-        let columnSyntax = `${filed.fieldName} ${this.getType(properties)}`;
-        let defaultValue = properties.type != FieldType.Boolean ? `'${properties.default}'` : !!properties.default;
+        let defaultRelation;
+        if (properties.relation && (properties.relation.type == RelationType.One2One || properties.relation.type == RelationType.One2Many)) {
+            defaultRelation = true;
+        }
+        let defaultValue = properties.type != FieldType.Boolean ? `'${defaultRelation ? 0 : properties.default}'` : !!properties.default;
+        let columnSyntax = `\`${filed.fieldName}\` ${this.getType(properties)}`;
         columnSyntax += (properties.required && properties.type != FieldType.Relation) || properties.primary ? ' NOT NULL' : '';
-        columnSyntax += properties.default ? ` DEFAULT '${defaultValue}'` : '';
+        columnSyntax += properties.default || properties.default === 0 || properties.default === '' || defaultRelation ? ` DEFAULT '${defaultValue}'` : '';
         columnSyntax += properties.unique ? ' UNIQUE ' : '';
         columnSyntax += properties.primary ? ' IDENTITY(1,1) ' : '';
         return columnSyntax;
@@ -897,7 +1141,7 @@ export class MSSQL extends Database {
             case FieldType.URL:
             case FieldType.String:
                 if (!properties.primary) {
-                    typeSyntax = `NVARCHAR(${properties.maxLength ? properties.maxLength : 255 })`;
+                    typeSyntax = `NVARCHAR(${properties.maxLength ? properties.maxLength : 255})`;
                 } else {
                     typeSyntax = 'BIGINT';
                 }
@@ -911,8 +1155,6 @@ export class MSSQL extends Database {
                 typeSyntax = `INT`;
                 break;
             case FieldType.Object:
-                typeSyntax = `BINARY`;
-                break;
             case FieldType.Text:
                 typeSyntax = `NTEXT`;
                 break;
@@ -961,31 +1203,27 @@ export class MSSQL extends Database {
         }
     }
 
-    private addOneToManyRelation<T, M>(model: T, relation: string, value: number
-        | { [property: string]: any }): Promise<IUpsertResult<M>> {
+    private addOneToManyRelation<T, M>(model: T, relation: string, value: number | { [property: string]: any }, transaction?: Transaction): Promise<IUpsertResult<M>> {
         let result: IUpsertResult<T> = <IUpsertResult<T>>{};
         let modelName = model.constructor['schema'].name;
         let fields = this.schemaList[modelName].getFields();
         let relatedModelName = fields[relation].properties.relation.model.schema.name;
         let readIdPromise;
         if (fields[relation].properties.relation.isWeek && typeof value == 'object' && !value[this.pk(relatedModelName)]) {
-            let relatedObject = new fields[relation].properties.relation.model(value);
-            readIdPromise = relatedObject.insert().then(result => {
-                return result.items[0][this.pk(relatedModelName)];
-            })
+            readIdPromise = this.insertOne(relatedModelName, value, transaction).then(result => result.items[0][this.pk(relatedModelName)])
         } else {
-            let id;
-            if (+value) {
+            let id = 0;
+            if (+value || +value === 0) {
                 id = +value;
             } else if (typeof value == 'object') {
                 id = +value[this.pk(relatedModelName)]
             }
-            if (!id || id <= 0) return Promise.reject(new Error(`invalid <<${relation}>> related model id`));
+            if (id < 0) return Promise.reject(new Error(`invalid <<${relation}>> related model id`));
             readIdPromise = Promise.resolve(id);
         }
         return readIdPromise
             .then(id => {
-                return this.query<Array<T>>(`UPDATE [${modelName}] SET [${relation}] = '${id}' WHERE ${this.pk(relatedModelName)}='${model[this.pk(relatedModelName)]}' `)
+                return this.query<Array<T>>(`UPDATE [${modelName}] SET [${relation}] = '${id}' WHERE ${this.pk(relatedModelName)}='${model[this.pk(relatedModelName)]}' `, null, transaction)
             })
             .then(updateResult => {
                 result.items = updateResult;
@@ -997,12 +1235,8 @@ export class MSSQL extends Database {
 
     }
 
-
-    private addManyToManyRelation<T, M>(model: T, relation: string, value: number
-        | Array<number>
-        | M
-        | Array<M>): Promise<IUpsertResult<M>> {
-        let result: IUpsertResult<T> = <IUpsertResult<T>>{};
+    private addManyToManyRelation<T, M>(model: T, relation: string, value: number | Array<number> | M | Array<M>, transaction?: Transaction): Promise<IUpsertResult<M>> {
+        let result: IUpsertResult<M> = <IUpsertResult<M>>{};
         let modelName = model.constructor['schema'].name;
         let fields = this.schemaList[modelName].getFields();
         let relatedModelName = fields[relation].properties.relation.model.schema.name;
@@ -1029,7 +1263,7 @@ export class MSSQL extends Database {
                 if (!newRelation.length) {
                     return relationIds;
                 }
-                return this.insertAll(relatedModelName, newRelation)
+                return this.insertAll(relatedModelName, newRelation, transaction)
                     .then(result => {
                         for (let i = result.items.length; i--;) {
                             relationIds.push(result.items[i][this.pk(relatedModelName)]);
@@ -1045,10 +1279,10 @@ export class MSSQL extends Database {
                 }
                 let insertList = [];
                 for (let i = relationIds.length; i--;) {
-                    insertList.push(`(${model[this.pk(modelName)]},${relationIds[i]})`);
+                    insertList.push(`(${model[this.pk(modelName)]},${this.escape(relationIds[i])})`);
                 }
                 return this.query<any>(`INSERT INTO ${modelName}Has${this.pascalCase(relation)}
-                    ([${this.camelCase(modelName)}],[${this.camelCase(relatedModelName)}]) VALUES ${insertList.join(',')}`)
+                    ([${this.camelCase(modelName)}],[${this.camelCase(relatedModelName)}]) VALUES ${insertList.join(',')}`, null, transaction)
                     .then(insertResult => {
                         result.items = insertResult;
                         return result
@@ -1061,7 +1295,7 @@ export class MSSQL extends Database {
 
     }
 
-    private removeOneToManyRelation<T>(model: T, relation: string) {
+    private removeOneToManyRelation<T>(model: T, relation: string, transaction: Transaction) {
         let modelName = model.constructor['schema'].name;
         let result: IUpsertResult<T> = <IUpsertResult<T>>{};
         let relatedModelName = this.schemaList[modelName].getFields()[relation].properties.relation.model.schema.name;
@@ -1070,12 +1304,12 @@ export class MSSQL extends Database {
         if (isWeek) {
             let readRelationId: Promise<number> = +model[relation] ? Promise.resolve(+model[relation]) : this.findById(modelName, model[this.pk(modelName)]).then(result => result.items[0][relation]);
             readRelationId.then(relationId => {
-                return this.deleteOne(relatedModelName, relationId).then(() => relationId);
+                return this.deleteOne(relatedModelName, relationId, transaction).then(() => relationId);
             })
         }
         return preparePromise
             .then(() => {
-                return this.query<any>(`UPDATE [${model}] SET ${relation} = 0 WHERE ${this.pk(modelName)} = ${this.escape(model[this.pk(modelName)])}`)
+                return this.query<any>(`UPDATE [${modelName}] SET ${relation} = 0 WHERE ${this.pk(modelName)} = ${this.escape(model[this.pk(modelName)])}`, null, transaction)
                     .then(updateResult => {
                         result.items = updateResult;
                         return result;
@@ -1088,7 +1322,7 @@ export class MSSQL extends Database {
 
     }
 
-    private removeManyToManyRelation<T>(model: T, relation: string, condition: Condition): Promise<any> {
+    private removeManyToManyRelation<T>(model: T, relation: string, condition: Condition, transaction: Transaction): Promise<any> {
         let modelName = model.constructor['schema'].name;
         let relatedModelName = this.schemaList[modelName].getFields()[relation].properties.relation.model.schema.name;
         let isWeek = this.schemaList[modelName].getFields()[relation].properties.relation.isWeek;
@@ -1115,7 +1349,7 @@ export class MSSQL extends Database {
                     conditions.push('FALSE');
                 }
                 conditionsStr = conditions.length ? ` AND ${conditions.join(' OR ')}` : '';
-                return this.query<Array<any>>(`SELECT * FROM ${model + 'Has' + this.pascalCase(relation)} WHERE ${this.camelCase(modelName)} = ${model[this.pk(modelName)]} ${conditionsStr}`)
+                return this.query<Array<any>>(`SELECT * FROM ${modelName + 'Has' + this.pascalCase(relation)} WHERE ${this.camelCase(modelName)} = ${model[this.pk(modelName)]} ${conditionsStr}`)
                     .then(items => {
                         let ids: Array<number> = [];
                         for (let i = items.length; i--;) {
@@ -1133,11 +1367,11 @@ export class MSSQL extends Database {
                     condition.append(new Condition(Condition.Operator.EqualTo).compare('id', ids[i]));
                 }
                 let idCondition = ids.length ? `(${ids.join(' OR ')})` : 'FALSE';
-                return this.query(`DELETE FROM ${model + 'Has' + this.pascalCase(relation)} WHERE ${this.camelCase(modelName)} = ${model[this.pk(modelName)]} AND ${idCondition}}`)
+                return this.query(`DELETE FROM ${model + 'Has' + this.pascalCase(relation)} WHERE ${this.camelCase(modelName)} = ${model[this.pk(modelName)]} AND ${idCondition}}`, null, transaction)
                     .then(() => {
-                        let result = {items: ids};
+                        let result = { items: ids };
                         if (isWeek && ids.length) {
-                            return this.deleteAll(relatedModelName, condition).then(() => result);
+                            return this.deleteAll(relatedModelName, condition, transaction).then(() => result);
                         }
                         return result;
                     });
@@ -1150,18 +1384,38 @@ export class MSSQL extends Database {
         return `N'${value.replace('\'', '\'\'')}'`;
     }
 
-    public query<T>(query: string): Promise<T> {
-        return new Promise((resolve, reject) => {
-            this.connection.query(query, (err, result) => {
-                if (err) return reject(err);
-                resolve(<T>result);
+    public query<T>(query: string, data?: Array<number | string | Array<number | string>>, transaction?: Transaction): Promise<T> {
+        if (!transaction) {
+            return new Promise((resolve, reject) => {
+                let connection = this.getConnection()
+                connection.query<T>(query, (err, result) => {
+                    if (err) {
+                        return reject(err);
+                    } else {
+                        resolve(<any>(result.recordset || result.output || result));
+                    }
+                })
             })
-        })
+        } else {
+            return this.prepareTransaction(transaction)
+                .then(transaction => new Promise<T>((resolve, reject) => {
+                    let connection = this.getConnection(transaction.connection);
+                    connection.query(query, (err, result) => {
+                        if (err) {
+                            return reject(err);
+                        } else {
+                            resolve(<any>(result.recordset || result.output || result));
+                        }
+                    })
+                }));
+
+        }
     }
 
-    public close(destroy: boolean): Promise<boolean> {
+
+    public close(connection: any): Promise<boolean> {
         return new Promise((resolve, reject) => {
-            this.SQLConnection.close((err) => {
+            this.pool.close((err) => {
                 if (err) reject(err);
                 else resolve(true);
             });
